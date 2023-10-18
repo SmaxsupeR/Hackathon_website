@@ -1,0 +1,23 @@
+body {
+  margin: 0;
+  line-height: normal;
+}
+
+:root {
+  /* fonts */
+  --font-poppins: Poppins;
+  --font-rubik: Rubik;
+  --font-century-gothic: "Century Gothic";
+
+  /* font sizes */
+  --font-size-base: 16px;
+  --font-size-21xl: 40px;
+  --font-size-xl-2: 20.2px;
+
+  /* Colors */
+  --color-white: #fff;
+  --color-gray: #1d1d36;
+  --color-cornflowerblue: #a4a3e7;
+  --color-gainsboro-200: #dedede;
+  --color-mediumslateblue: #5c5adb;
+}
