@@ -421,6 +421,12 @@ export async function getQueueCounts(db: Db, opts: QueueOptions): Promise<QueueC
   return { due: Math.min(due?.n ?? 0, opts.maxReviews), fresh: Math.min(fresh?.n ?? 0, left) };
 }
 
+/** Random translations from the whole collection, used as wrong answers in multiple-choice questions. */
+export async function getRandomMeanings(db: Db, limit: number): Promise<string[]> {
+  const rows = await db.getAllAsync<{ text: string }>('SELECT text FROM entry_meanings WHERE position = 0 ORDER BY RANDOM() LIMIT ?', [limit]);
+  return rows.map((r) => r.text);
+}
+
 export async function startSession(db: Db, mode: string, dictionaryIds: string[], now = Date.now()): Promise<string> {
   const id = newId();
   await db.runAsync('INSERT INTO practice_sessions (id, mode, dictionary_ids, started_at) VALUES (?, ?, ?, ?)', [id, mode, JSON.stringify(dictionaryIds), now]);

@@ -13,6 +13,8 @@ export interface Settings {
   cardDirection: CardDirection;
   strictSpacing: boolean;
   autoSpeak: boolean;
+  /** Four ratings (again / hard / good / easy) instead of two. */
+  detailedGrading: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -24,6 +26,7 @@ export const DEFAULT_SETTINGS: Settings = {
   cardDirection: 'ko-first',
   strictSpacing: false,
   autoSpeak: false,
+  detailedGrading: false,
 };
 
 export function settingsFromPrefs(prefs: Record<string, string>): Settings {
