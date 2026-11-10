@@ -61,7 +61,7 @@ export default function SettingsScreen() {
     </Row>
   );
 
-  const toggle = (label: string, key: 'showRomanization' | 'strictSpacing' | 'detailedGrading', hint?: string) => (
+  const toggle = (label: string, key: 'showRomanization' | 'strictSpacing' | 'autoSpeak', hint?: string) => (
     <View>
       <Row style={styles.between}>
         <Text style={[styles.label, { color: t.text }]}>{label}</Text>
@@ -94,7 +94,7 @@ export default function SettingsScreen() {
       <Card>
         {toggle(tr('showRomanization'), 'showRomanization', tr('showRomanizationHint'))}
         {toggle(tr('strictSpacing'), 'strictSpacing')}
-        {toggle(tr('detailedGrading'), 'detailedGrading', tr('detailedGradingHint'))}
+        {toggle(tr('autoSpeak'), 'autoSpeak')}
       </Card>
 
       <Section>{tr('data')}</Section>

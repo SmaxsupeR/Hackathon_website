@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { Rating } from '../core/scheduler';
+import { answer, completeIntro, createSession, currentTask, GRADE, type Direction, type Session } from '../core/learning';
+import { Rating, State } from '../core/scheduler';
 import * as repo from './repo';
 import { migrate, MIGRATIONS, TABLES, type Db } from './schema';
 import { openTestDb } from './testing';
@@ -20,7 +21,25 @@ async function seed(words: [string, string][] = [['나무', 'дерево'], ['�
   return { dict, ids };
 }
 
-const queue = (dictionaryIds: string[], now = NOW, newPerDay = 20) => repo.getStudyQueue(db, { dictionaryIds, skill: 'recall', now, newPerDay, maxReviews: 100 });
+const BOTH: Direction[] = ['ko_ru', 'ru_ko'];
+const plan = (now = NOW, opts: Partial<repo.PlanOptions> = {}) =>
+  repo.planSession(db, { dictionaryIds: [], directions: BOTH, now, newPerDay: 20, maxReviews: 100, ...opts });
+
+async function startFromPlan(now: number, opts: Partial<repo.PlanOptions> = {}): Promise<Session> {
+  const p = await plan(now, opts);
+  return createSession({ ...p, directions: opts.directions ?? BOTH, hasChoice: () => true });
+}
+
+/** Answers the current step and saves it, as the study screen does. */
+async function step(s: Session, correct: boolean, now: number): Promise<Session> {
+  const task = currentTask(s);
+  if (!task) throw new Error('no task');
+  const r = task.kind === 'intro' ? completeIntro(s) : answer(s, correct);
+  await repo.applyEffects(db, r.effects, { now, retention: 0.9 });
+  return r.session;
+}
+
+const count = async (sql: string, params: (string | number)[] = []) => (await db.getFirstAsync<{ n: number }>(sql, params))?.n ?? 0;
 
 describe('schema', () => {
   it('migrates once and is idempotent', async () => {
@@ -44,8 +63,27 @@ describe('schema', () => {
     await seed();
     await expect(migrate(db, [...MIGRATIONS, 'CREATE TABLE x (id TEXT); THIS IS NOT SQL;'])).rejects.toThrow();
     expect(await migrate(db)).toBe(MIGRATIONS.length);
-    const t = await db.getAllAsync("SELECT name FROM sqlite_master WHERE name = 'x'", []);
-    expect(t).toEqual([]);
+    expect(await db.getAllAsync("SELECT name FROM sqlite_master WHERE name = 'x'", [])).toEqual([]);
+  });
+  it('upgrades version 1 data: old skills become directions, studied words count as shown', async () => {
+    const old = openTestDb();
+    await migrate(old, MIGRATIONS.slice(0, 1));
+    await old.runAsync("INSERT INTO dictionaries (id, name, color, created_at, updated_at) VALUES ('d', 'D', '#000', 1, 1)", []);
+    for (const id of ['a', 'b']) {
+      await old.runAsync("INSERT INTO entries (id, dictionary_id, korean, korean_norm, created_at, updated_at) VALUES (?, 'd', ?, ?, 1, 1)", [id, id, id]);
+    }
+    await old.runAsync("INSERT INTO review_cards (id, entry_id, skill, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps, reps, lapses, state, last_review) VALUES ('c1', 'a', 'recall', 5, 3, 5, 0, 3, 0, 1, 0, 2, 2)", []);
+    await old.runAsync("INSERT INTO review_cards (id, entry_id, skill, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps, reps, lapses, state, last_review) VALUES ('c2', 'a', 'typing', 5, 3, 5, 0, 3, 0, 1, 0, 2, 2)", []);
+    await old.runAsync("INSERT INTO review_history (id, entry_id, skill, rating, state, due, stability, difficulty, elapsed_days, scheduled_days, reviewed_at) VALUES ('h', 'a', 'recall', 3, 0, 5, 3, 5, 0, 3, 1234)", []);
+    await old.runAsync("INSERT INTO practice_attempts (id, entry_id, skill, mode, is_correct, created_at) VALUES ('p', 'a', 'typing', 'typing', 1, 1234)", []);
+    expect(await migrate(old)).toBe(MIGRATIONS.length);
+    expect(await old.getAllAsync('SELECT skill FROM review_cards ORDER BY id', [])).toEqual([{ skill: 'ko_ru' }, { skill: 'ru_ko' }]);
+    expect(await old.getAllAsync('SELECT skill FROM review_history', [])).toEqual([{ skill: 'ko_ru' }]);
+    expect(await old.getAllAsync('SELECT skill, mode, self_accepted FROM practice_attempts', [])).toEqual([{ skill: 'ru_ko', mode: 'review', self_accepted: 0 }]);
+    expect(await old.getAllAsync('SELECT id, introduced_at FROM entries ORDER BY id', [])).toEqual([
+      { id: 'a', introduced_at: 1234 },
+      { id: 'b', introduced_at: null },
+    ]);
   });
 });
 
@@ -61,7 +99,7 @@ describe('dictionaries and entries', () => {
       notes: ' заметка ',
     }, NOW + 10);
     const e = await repo.getEntry(db, id);
-    expect(e).toMatchObject({ korean: '학교', meanings: ['школа', 'school'], romanization: 'hakgyo', example: '학교에 가요', exampleTranslation: 'Иду в школу', tags: ['места'], notes: 'заметка', mastery: 'new', card: null });
+    expect(e).toMatchObject({ korean: '학교', meanings: ['школа', 'school'], romanization: 'hakgyo', example: '학교에 가요', exampleTranslation: 'Иду в школу', tags: ['места'], notes: 'заметка', mastery: 'new', introduced_at: null });
     await repo.updateEntry(db, id, { korean: '학교', meanings: ['школа'], transcription: 'хаккё' });
     expect(await repo.getEntry(db, id)).toMatchObject({ meanings: ['школа'], transcription: 'хаккё', example: null, tags: [] });
     const list = await repo.listEntries(db, { dictionaryId: dict });
@@ -93,7 +131,7 @@ describe('dictionaries and entries', () => {
   });
   it('summarises, duplicates and cascades on delete', async () => {
     const { dict, ids } = await seed();
-    await repo.recordReview(db, { entryId: ids[0], skill: 'recall', mode: 'cards', rating: Rating.Good, now: NOW, retention: 0.9 });
+    await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
     const copy = (await repo.duplicateDictionary(db, dict, 'Копия', NOW + 5)) as string;
     const list = await repo.listDictionaries(db, NOW + DAY * 2);
     expect(list.find((d) => d.id === dict)).toMatchObject({ entry_count: 3, due_count: 1, new_count: 2 });
@@ -119,7 +157,7 @@ describe('dictionaries and entries', () => {
     expect((await repo.listEntries(db, { dictionaryId: dict })).map((e) => e.korean)).toEqual(['하나', '둘']);
     const out = await repo.exportRows(db, dict);
     expect(out.map((r) => r.korean)).toEqual(['하나', '둘']);
-    expect((await queue([dict])).map((i) => i.entry.korean)).toEqual(['하나', '둘']);
+    expect((await plan(NOW, { dictionaryIds: [dict] })).fresh).toEqual(await (async () => (await repo.listEntries(db, { dictionaryId: dict })).map((e) => e.id))());
     expect(out.find((r) => r.korean === '둘')).toEqual(rows[1]);
   });
   it('import is all-or-nothing', async () => {
@@ -129,72 +167,187 @@ describe('dictionaries and entries', () => {
   });
 });
 
-describe('study flow', () => {
-  it('a newly added word can be studied right away and comes back later', async () => {
-    const { dict, ids } = await seed();
-    let q = await queue([dict]);
-    expect(q.map((i) => [i.entry.korean, i.isNew])).toEqual([['나무', true], ['물', true], ['사과', true]]);
-    const session = await repo.startSession(db, 'cards', [dict], NOW);
-    const card = await repo.recordReview(db, { entryId: ids[0], skill: 'recall', mode: 'cards', rating: Rating.Good, now: NOW, retention: 0.9, sessionId: session, durationMs: 4000 });
-    expect(card.due).toBeGreaterThan(NOW);
-    await repo.recordReview(db, { entryId: ids[1], skill: 'recall', mode: 'cards', rating: Rating.Again, now: NOW + 1000, retention: 0.9, sessionId: session, durationMs: 2000 });
-    await repo.finishSession(db, session, NOW + 5000);
-    const s = await db.getFirstAsync<{ total: number; correct: number; finished_at: number }>('SELECT * FROM practice_sessions WHERE id = ?', [session]);
-    expect(s).toMatchObject({ total: 2, correct: 1, finished_at: NOW + 5000 });
+describe('study plan', () => {
+  it('offers new words within the daily limit, counted by words shown today', async () => {
+    const { ids } = await seed();
+    expect((await plan(NOW, { newPerDay: 2 })).fresh).toEqual(ids.slice(0, 2));
+    let s = await startFromPlan(NOW, { newPerDay: 2 });
+    s = await step(s, true, NOW); // intro of the first word
+    expect((await plan(NOW + 1000, { newPerDay: 2 })).fresh).toEqual([ids[1]]);
+    expect(await repo.introducedToday(db, NOW)).toBe(1);
+    expect((await plan(NOW + DAY, { newPerDay: 2 })).fresh).toEqual(ids.slice(1, 3));
+    expect(s.queue.length).toBeGreaterThan(0);
+  });
 
-    q = await queue([dict], NOW + 2000);
-    expect(q.map((i) => i.entry.korean)).toEqual(['사과']); // the others are scheduled for later
-    q = await queue([dict], NOW + DAY);
-    expect(q.map((i) => [i.entry.korean, i.isNew])).toEqual([['물', false], ['나무', false], ['사과', true]]);
-    expect((await repo.getEntry(db, ids[0]))?.mastery).toBe('learning');
+  it('a shown word is not new any more, but is not learned either', async () => {
+    const { ids } = await seed();
+    let s = await startFromPlan(NOW);
+    s = await step(s, true, NOW);
+    const e = await repo.getEntry(db, ids[0]);
+    expect(e?.mastery).toBe('learning');
+    expect(await count('SELECT COUNT(*) AS n FROM review_cards')).toBe(0);
+    expect(await db.getAllAsync('SELECT direction, phase, errors FROM acquisition ORDER BY direction', [])).toEqual([
+      { direction: 'ko_ru', phase: 'recognition', errors: 0 },
+      { direction: 'ru_ko', phase: 'recognition', errors: 0 },
+    ]);
+    const o = await repo.getOverview(db, NOW);
+    expect(o).toMatchObject({ newWords: 2, learningWords: 1, stableWords: 0, newToday: 1 });
   });
-  it('respects the daily limit of new words and resets next day', async () => {
-    const { dict, ids } = await seed();
-    expect((await queue([dict], NOW, 2)).length).toBe(2);
-    await repo.recordReview(db, { entryId: ids[0], skill: 'recall', mode: 'cards', rating: Rating.Easy, now: NOW, retention: 0.9 });
-    await repo.recordReview(db, { entryId: ids[1], skill: 'recall', mode: 'cards', rating: Rating.Easy, now: NOW, retention: 0.9 });
-    expect(await queue([dict], NOW + 1000, 2)).toEqual([]);
-    expect(await repo.getQueueCounts(db, { dictionaryIds: [dict], skill: 'recall', now: NOW + 1000, newPerDay: 2, maxReviews: 100 })).toEqual({ due: 0, fresh: 0 });
-    const tomorrow = await repo.getQueueCounts(db, { dictionaryIds: [dict], skill: 'recall', now: NOW + DAY, newPerDay: 2, maxReviews: 100 });
-    expect(tomorrow.fresh).toBe(1);
+
+  it('puts a card into FSRS only when training ends, with the first rating from the training errors', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    let s = await startFromPlan(NOW, { directions: ['ko_ru'] });
+    s = await step(s, true, NOW); // intro
+    s = await step(s, false, NOW + 1000); // wrong choice
+    expect(await count('SELECT COUNT(*) AS n FROM review_cards')).toBe(0);
+    s = await step(s, true, NOW + 2000); // right choice
+    expect(await count('SELECT COUNT(*) AS n FROM review_cards')).toBe(0);
+    s = await step(s, true, NOW + 3000); // right recall: graduates with Hard
+    const card = await repo.getCard(db, ids[0], 'ko_ru');
+    expect(card).not.toBeNull();
+    expect(card?.state).toBe(State.Review);
+    expect(await db.getAllAsync('SELECT rating, skill FROM review_history', [])).toEqual([{ rating: GRADE.hard, skill: 'ko_ru' }]);
+    expect(await count('SELECT COUNT(*) AS n FROM acquisition')).toBe(0);
+    expect(Math.round(((card?.due ?? 0) - (NOW + 3000)) / DAY)).toBe(1);
+    expect(s.queue).toEqual([]);
   });
-  it('keeps skills separate', async () => {
-    const { dict, ids } = await seed();
-    await repo.recordReview(db, { entryId: ids[0], skill: 'typing', mode: 'typing', rating: Rating.Good, now: NOW, retention: 0.9, answerGiven: '나무' });
-    expect((await repo.getEntry(db, ids[0], 'recall'))?.card).toBeNull();
-    expect((await repo.getEntry(db, ids[0], 'typing'))?.card?.reps).toBe(1);
-    expect((await queue([dict], NOW + 1000)).length).toBe(3);
+
+  it('a training without errors schedules the first review later than one with errors', async () => {
+    const { ids } = await seed([['나무', 'дерево'], ['물', 'вода']]);
+    let s = await startFromPlan(NOW, { directions: ['ko_ru'] });
+    let missed = false;
+    while (currentTask(s)) {
+      const task = currentTask(s);
+      const wrong = !missed && task?.kind === 'recognize' && s.cards[task.key].entryId === ids[1];
+      if (wrong) missed = true;
+      s = await step(s, !wrong, NOW + 5000);
+    }
+    const days = async (id: string) => Math.round((((await repo.getCard(db, id, 'ko_ru'))?.due ?? 0) - NOW) / DAY);
+    expect(await days(ids[0])).toBe(2); // Good
+    expect(await days(ids[1])).toBe(1); // Hard
   });
-  it('skips paused and archived dictionaries in the common queue', async () => {
-    const { dict } = await seed();
-    expect((await queue([])).length).toBe(3);
+
+  it('leaving in the middle keeps every step; the next session continues from the same stage', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    let s = await startFromPlan(NOW, { directions: ['ko_ru'] });
+    s = await step(s, true, NOW); // intro
+    s = await step(s, true, NOW + 1000); // recognition passed → recall is next
+    // The learner closes the app here.
+    const p = await plan(NOW + 60000, { directions: ['ko_ru'] });
+    expect(p.fresh).toEqual([]);
+    expect(p.learning).toEqual([{ entryId: ids[0], direction: 'ko_ru', phase: 'recall', errors: 0, reintroduce: false }]);
+    const resumed = createSession({ ...p, directions: ['ko_ru'], hasChoice: () => true });
+    const task = currentTask(resumed);
+    expect(task?.kind === 'recall' && task.purpose).toBe('acquisition');
+  });
+
+  it('shows a word again when its training was interrupted more than a day ago', async () => {
+    await seed([['나무', 'дерево']]);
+    let s = await startFromPlan(NOW, { directions: ['ko_ru'] });
+    s = await step(s, true, NOW);
+    expect((await plan(NOW + 2 * DAY, { directions: ['ko_ru'] })).learning[0].reintroduce).toBe(true);
+  });
+
+  it('reviews only one direction of a word per session and keeps paused dictionaries out', async () => {
+    const { dict, ids } = await seed([['나무', 'дерево']]);
+    for (const d of BOTH) await repo.recordReview(db, { entryId: ids[0], skill: d, mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
+    const later = NOW + 30 * DAY;
+    const p = await plan(later);
+    expect(p.reviews).toHaveLength(1);
+    expect(p.learning).toEqual([]);
+    expect(await repo.getPlanCounts(db, { dictionaryIds: [], directions: BOTH, now: later, newPerDay: 20, maxReviews: 100 })).toEqual({ due: 1, learning: 0, fresh: 0 });
     await repo.updateDictionary(db, dict, { is_paused: 1 });
-    expect(await queue([])).toEqual([]);
-    expect((await queue([dict])).length).toBe(3); // explicit choice still works
+    expect((await plan(later)).reviews).toEqual([]);
+    expect((await plan(later, { dictionaryIds: [dict] })).reviews).toHaveLength(1);
+  });
+
+  it('starts the second direction for a word whose first direction is already scheduled', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
+    const p = await plan(NOW + 1000);
+    expect(p.learning).toEqual([{ entryId: ids[0], direction: 'ru_ko', phase: 'recognition', errors: 0, reintroduce: false }]);
+    expect((await plan(NOW + 1000, { directions: ['ko_ru'] })).learning).toEqual([]);
+  });
+
+  it('a wrong review is rated once in FSRS; relearning in the same session is only logged', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
+    const later = NOW + 10 * DAY;
+    let s = await startFromPlan(later, { directions: ['ko_ru'] });
+    s = await step(s, false, later);
+    s = await step(s, false, later + 1000);
+    s = await step(s, true, later + 2000);
+    expect(s.queue).toEqual([]);
+    const history = await db.getAllAsync<{ rating: number }>('SELECT rating FROM review_history ORDER BY reviewed_at', []);
+    expect(history.map((h) => h.rating)).toEqual([Rating.Good, Rating.Again]);
+    expect(await db.getAllAsync('SELECT mode, is_correct, rating FROM practice_attempts ORDER BY created_at', [])).toEqual([
+      { mode: 'review', is_correct: 1, rating: Rating.Good },
+      { mode: 'review', is_correct: 0, rating: Rating.Again },
+      { mode: 'relearn', is_correct: 0, rating: null },
+      { mode: 'relearn', is_correct: 1, rating: null },
+    ]);
+    const card = await repo.getCard(db, ids[0], 'ko_ru');
+    expect(card?.lapses).toBe(1);
+    expect(Math.round(((card?.due ?? 0) - later) / DAY)).toBe(1);
+  });
+
+  it('applyEffects is atomic', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    await expect(
+      repo.applyEffects(
+        db,
+        [
+          { type: 'introduce', entryId: ids[0], directions: ['ko_ru'] },
+          { type: 'phase', entryId: 'missing-entry', direction: 'ko_ru', phase: 'recall', errors: 0 },
+        ],
+        { now: NOW, retention: 0.9 },
+      ),
+    ).rejects.toThrow();
+    expect((await repo.getEntry(db, ids[0]))?.introduced_at).toBeNull();
   });
 });
 
 describe('statistics', () => {
-  it('reports overview, streak, activity, forecast and hardest words', async () => {
-    const { ids } = await seed();
-    const review = (i: number, rating: Rating, now: number) => repo.recordReview(db, { entryId: ids[i], skill: 'recall', mode: 'cards', rating: rating as 1 | 2 | 3 | 4, now, retention: 0.9, durationMs: 3000 });
-    await review(0, Rating.Easy, NOW - 2 * DAY);
-    await review(0, Rating.Again, NOW - DAY);
-    await review(1, Rating.Good, NOW - DAY);
-    await review(1, Rating.Good, NOW);
-    const o = await repo.getOverview(db, NOW);
-    expect(o).toMatchObject({ totalWords: 3, newWords: 1, learningWords: 2, stableWords: 0, reviewsToday: 1, newToday: 0, msToday: 3000, totalReviews: 4, totalMs: 12000, streakDays: 3 });
+  it('keeps recognition and recall apart and counts every answer', async () => {
+    await seed([['나무', 'дерево'], ['물', 'вода']]);
+    let s = await startFromPlan(NOW, { directions: ['ko_ru'] });
+    let n = 0;
+    while (currentTask(s)) s = await step(s, currentTask(s)?.kind === 'intro' || n++ !== 0, NOW + n * 1000);
+    expect(await repo.getAccuracy(db)).toEqual([
+      { kind: 'recognition', total: 3, correct: 2 },
+      { kind: 'ko_ru', total: 2, correct: 2 },
+    ]);
+    const o = await repo.getOverview(db, NOW + DAY / 4);
+    expect(o).toMatchObject({ totalWords: 2, newWords: 0, learningWords: 2, stableWords: 0, answersToday: 5, newToday: 2, totalAnswers: 5, streakDays: 1 });
+    const hardest = await repo.getHardestWords(db, 5);
+    expect(hardest).toHaveLength(1);
+    expect(hardest[0]).toMatchObject({ mistakes: 1, answers: 3 });
+    const act = await repo.getDailyActivity(db, NOW, 3);
+    expect(act.map((d) => [d.answers, d.correct])).toEqual([[0, 0], [0, 0], [5, 4]]);
+    const forecast = await repo.getForecast(db, NOW, 4);
+    expect(forecast.reduce((a, d) => a + d.count, 0)).toBe(2);
+    expect(forecast[0].count).toBe(0);
+  });
+
+  it('counts a word as stable only when every scheduled direction has a long interval', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    let t = NOW;
+    for (let i = 0; i < 6; i++) {
+      const c = await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: t, retention: 0.9 });
+      t = c.due;
+    }
+    expect((await repo.getEntry(db, ids[0]))?.mastery).toBe('stable');
+    await repo.applyEffects(db, [{ type: 'phase', entryId: ids[0], direction: 'ru_ko', phase: 'recognition', errors: 0 }], { now: t, retention: 0.9 });
+    expect((await repo.getEntry(db, ids[0]))?.mastery).toBe('learning');
+    expect((await repo.getOverview(db, t)).stableWords).toBe(0);
+  });
+
+  it('counts the streak from answers', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    for (const d of [2, 1, 0]) await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW - d * DAY, retention: 0.9 });
+    expect(await repo.getStreak(db, NOW)).toBe(3);
     expect(await repo.getStreak(db, NOW + DAY)).toBe(3);
     expect(await repo.getStreak(db, NOW + 2 * DAY)).toBe(0);
-    const act = await repo.getDailyActivity(db, NOW, 7);
-    expect(act.map((d) => d.reviews)).toEqual([0, 0, 0, 0, 1, 2, 1]);
-    expect(act.map((d) => d.correct)).toEqual([0, 0, 0, 0, 1, 1, 1]);
-    const forecast = await repo.getForecast(db, NOW, 7);
-    expect(forecast.length).toBe(7);
-    expect(forecast.reduce((n, d) => n + d.count, 0)).toBeGreaterThanOrEqual(1);
-    expect(forecast[0].count).toBeGreaterThanOrEqual(1); // the lapsed card is overdue
-    expect(await repo.getHardestWords(db, 5)).toEqual([{ id: ids[0], korean: '나무', meaning: 'дерево', lapses: 1, reps: 2 }]);
-    expect(await repo.getAccuracyBySkill(db)).toEqual([{ skill: 'recall', total: 4, correct: 3 }]);
   });
 });
 
@@ -204,33 +357,59 @@ describe('preferences and backup', () => {
     await repo.savePreference(db, 'language', 'en');
     expect(await repo.loadPreferences(db)).toEqual({ language: 'en' });
   });
-  it('restores dictionaries and review history into an empty database', async () => {
-    const { dict, ids } = await seed();
-    await repo.createEntry(db, dict, { korean: '집', meanings: ['дом'], example: '집에 가요', tags: ['a'] }, NOW + 50);
-    await repo.recordReview(db, { entryId: ids[0], skill: 'recall', mode: 'cards', rating: Rating.Good, now: NOW, retention: 0.9 });
+
+  it('restores dictionaries, training stages and review history into an empty database', async () => {
+    const { ids } = await seed();
+    let s = await startFromPlan(NOW);
+    for (let i = 0; i < 6; i++) s = await step(s, true, NOW + i * 1000);
+    await repo.recordReview(db, { entryId: ids[2], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
     await repo.savePreference(db, 'newPerDay', '15');
     const json = JSON.stringify(await repo.exportBackup(db, NOW));
+    expect(JSON.parse(json).tables.acquisition.length).toBeGreaterThan(0);
 
     const fresh = openTestDb();
     await migrate(fresh);
-    const n = await repo.restoreBackup(fresh, repo.parseBackup(json));
-    expect(n).toBeGreaterThan(10);
+    expect(await repo.restoreBackup(fresh, repo.parseBackup(json))).toBeGreaterThan(10);
     expect(JSON.stringify(await repo.exportBackup(fresh, NOW))).toBe(json);
-    expect((await repo.getEntry(fresh, ids[0]))?.card?.reps).toBe(1);
   });
+
+  it('reads version 1 backups', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
+    const b = await repo.exportBackup(db, NOW);
+    const v1 = {
+      ...b,
+      version: 1,
+      tables: {
+        ...b.tables,
+        acquisition: undefined,
+        entries: b.tables.entries.map(({ introduced_at, ...rest }) => rest),
+        review_cards: b.tables.review_cards.map((r) => ({ ...r, skill: 'recall' })),
+        review_history: b.tables.review_history.map((r) => ({ ...r, skill: 'recall' })),
+        practice_attempts: b.tables.practice_attempts.map(({ self_accepted, ...r }) => ({ ...r, skill: 'recall', mode: 'cards' })),
+      },
+    };
+    const fresh = openTestDb();
+    await migrate(fresh);
+    await repo.restoreBackup(fresh, repo.parseBackup(JSON.stringify(v1)));
+    expect(await repo.getCard(fresh, ids[0], 'ko_ru')).not.toBeNull();
+    expect((await repo.getEntry(fresh, ids[0]))?.introduced_at).toBe(NOW);
+    expect(await fresh.getAllAsync('SELECT skill, mode, self_accepted FROM practice_attempts', [])).toEqual([{ skill: 'ko_ru', mode: 'review', self_accepted: 0 }]);
+  });
+
   it('merges without losing newer data', async () => {
     const { dict, ids } = await seed();
     const backup = await repo.exportBackup(db, NOW);
     const added = await repo.createEntry(db, dict, { korean: '집', meanings: ['дом'] }, NOW + 50);
-    await repo.recordReview(db, { entryId: ids[0], skill: 'recall', mode: 'cards', rating: Rating.Good, now: NOW, retention: 0.9 });
+    await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
     await repo.deleteEntry(db, ids[2]);
     await repo.restoreBackup(db, repo.parseBackup(JSON.stringify(backup)));
     const words = (await repo.listEntries(db, { dictionaryId: dict })).map((e) => e.korean).sort();
     expect(words).toEqual(['나무', '물', '사과', '집'].sort());
     expect(await repo.getEntry(db, added)).not.toBeNull();
-    expect((await repo.getEntry(db, ids[0]))?.card?.reps).toBe(1);
-    expect((await repo.getEntry(db, ids[0]))?.meanings).toEqual(['дерево']);
+    expect((await repo.getCard(db, ids[0], 'ko_ru'))?.reps).toBe(1);
   });
+
   it('rejects files that are not backups and leaves data untouched on a broken one', async () => {
     const { dict } = await seed();
     expect(() => repo.parseBackup('hello')).toThrow('not_json');

@@ -1,8 +1,14 @@
 // App settings, kept in memory and saved to the user_preferences table.
 import { create } from 'zustand';
+import type { Direction } from '../core/learning';
 
 export type Language = 'ru' | 'en';
-export type CardDirection = 'ko-first' | 'meaning-first';
+/** Which directions are practised: both, or only one of them. */
+export type DirectionSetting = 'both' | Direction;
+
+export function directionList(setting: DirectionSetting): Direction[] {
+  return setting === 'both' ? ['ko_ru', 'ru_ko'] : [setting];
+}
 
 export interface Settings {
   language: Language;
@@ -10,11 +16,9 @@ export interface Settings {
   maxReviews: number;
   retention: number;
   showRomanization: boolean;
-  cardDirection: CardDirection;
+  directions: DirectionSetting;
   strictSpacing: boolean;
   autoSpeak: boolean;
-  /** Four ratings (again / hard / good / easy) instead of two. */
-  detailedGrading: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -23,10 +27,9 @@ export const DEFAULT_SETTINGS: Settings = {
   maxReviews: 100,
   retention: 0.9,
   showRomanization: true,
-  cardDirection: 'ko-first',
+  directions: 'both',
   strictSpacing: false,
-  autoSpeak: false,
-  detailedGrading: false,
+  autoSpeak: true,
 };
 
 export function settingsFromPrefs(prefs: Record<string, string>): Settings {
@@ -35,7 +38,9 @@ export function settingsFromPrefs(prefs: Record<string, string>): Settings {
     if (!(key in prefs)) continue;
     try {
       const value = JSON.parse(prefs[key]);
-      if (typeof value === typeof DEFAULT_SETTINGS[key]) (out as unknown as Record<string, unknown>)[key] = value;
+      if (typeof value !== typeof DEFAULT_SETTINGS[key]) continue;
+      if (key === 'directions' && !['both', 'ko_ru', 'ru_ko'].includes(value)) continue;
+      (out as unknown as Record<string, unknown>)[key] = value;
     } catch {
       // A damaged value falls back to the default.
     }

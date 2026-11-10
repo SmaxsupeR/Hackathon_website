@@ -99,3 +99,73 @@ export function checkAnswer(given: string, accepted: string[], opts: CompareOpti
 function score(diff: DiffPart[]): number {
   return diff.reduce((n, p) => n + (p.kind === 'same' ? p.text.length : -p.text.length), 0);
 }
+
+// ---------- Translation answers (Korean → meaning) ----------
+
+function plain(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(PUNCTUATION, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * All the ways one stored meaning may be written: "идти (пешком)" also accepts
+ * "идти"; "to go" also accepts "go"; "дом, жилище", "дом; жилище" and "дом / жилище" accept each part.
+ */
+export function meaningVariants(meaning: string): string[] {
+  const out = new Set<string>();
+  const add = (v: string) => {
+    const p = plain(v);
+    if (p === '') return;
+    out.add(p);
+    if (p.startsWith('to ')) out.add(p.slice(3));
+  };
+  const withoutBrackets = meaning.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ');
+  for (const source of [meaning, withoutBrackets]) {
+    add(source);
+    for (const part of source.split(/[,/;]/)) add(part);
+  }
+  return [...out];
+}
+
+/** Edit distance where swapping two neighbouring letters counts as one edit. */
+export function editDistance(a: string, b: string): number {
+  const x = Array.from(a);
+  const y = Array.from(b);
+  const d: number[][] = Array.from({ length: x.length + 1 }, (_, i) => Array.from({ length: y.length + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)));
+  for (let i = 1; i <= x.length; i++) {
+    for (let j = 1; j <= y.length; j++) {
+      const cost = x[i - 1] === y[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && x[i - 1] === y[j - 2] && x[i - 2] === y[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+  }
+  return d[x.length][y.length];
+}
+
+export interface MeaningResult {
+  correct: boolean;
+  /** Accepted with one typo; the right spelling should be shown. */
+  typo: boolean;
+  /** The stored meaning that matched, or the first one on a mistake. */
+  expected: string;
+}
+
+/** Words of this length or longer may contain one typo and still count. */
+export const TYPO_MIN_LENGTH = 5;
+
+/** Checks a typed translation against every stored meaning. */
+export function checkMeaning(given: string, meanings: string[]): MeaningResult {
+  const g = plain(given);
+  const list = meanings.filter((m) => m.trim() !== '');
+  const fallback = { correct: false, typo: false, expected: list[0] ?? '' };
+  if (g === '') return fallback;
+  for (const m of list) if (meaningVariants(m).includes(g)) return { correct: true, typo: false, expected: m };
+  if (Array.from(g).length >= TYPO_MIN_LENGTH) {
+    for (const m of list) if (meaningVariants(m).some((v) => editDistance(v, g) === 1)) return { correct: true, typo: true, expected: m };
+  }
+  return fallback;
+}

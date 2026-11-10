@@ -142,6 +142,33 @@ export const MIGRATIONS: string[] = [
     value TEXT NOT NULL
   );
   `,
+  // v2: training before spaced repetition, one card per direction.
+  `
+  ALTER TABLE entries ADD COLUMN introduced_at INTEGER;
+  -- Cards that are still in training. A card gets an FSRS row in review_cards only
+  -- when training ends, and its row here is deleted at the same moment.
+  CREATE TABLE acquisition (
+    entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    errors INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (entry_id, direction)
+  );
+  ALTER TABLE practice_attempts ADD COLUMN self_accepted INTEGER NOT NULL DEFAULT 0;
+  -- Old skills become directions: flashcards were Korean → meaning, typing was meaning → Korean.
+  UPDATE review_cards SET skill = 'ko_ru' WHERE skill = 'recall';
+  UPDATE review_cards SET skill = 'ru_ko' WHERE skill = 'typing';
+  UPDATE review_history SET skill = 'ko_ru' WHERE skill = 'recall';
+  UPDATE review_history SET skill = 'ru_ko' WHERE skill = 'typing';
+  UPDATE practice_attempts SET skill = 'ko_ru' WHERE skill = 'recall';
+  UPDATE practice_attempts SET skill = 'ru_ko' WHERE skill = 'typing';
+  UPDATE practice_attempts SET mode = 'review' WHERE mode IN ('cards', 'typing');
+  UPDATE entries SET introduced_at = (SELECT MIN(reviewed_at) FROM review_history h WHERE h.entry_id = entries.id)
+    WHERE introduced_at IS NULL AND EXISTS (SELECT 1 FROM review_cards c WHERE c.entry_id = entries.id);
+  CREATE INDEX idx_entries_introduced ON entries(introduced_at);
+  CREATE INDEX idx_attempts_time ON practice_attempts(created_at);
+  `,
 ];
 
 /** Columns of every table, in backup order (parents before children). */
@@ -149,14 +176,15 @@ export const TABLES: Record<string, string[]> = {
   folders: ['id', 'parent_id', 'name', 'position', 'created_at', 'updated_at'],
   dictionaries: ['id', 'folder_id', 'name', 'description', 'color', 'icon', 'is_favorite', 'is_archived', 'is_paused', 'created_at', 'updated_at', 'last_used_at'],
   media_assets: ['id', 'kind', 'uri', 'mime', 'created_at'],
-  entries: ['id', 'dictionary_id', 'kind', 'korean', 'korean_norm', 'romanization', 'transcription', 'part_of_speech', 'grammar_notes', 'notes', 'image_asset_id', 'is_favorite', 'created_at', 'updated_at'],
+  entries: ['id', 'dictionary_id', 'kind', 'korean', 'korean_norm', 'romanization', 'transcription', 'part_of_speech', 'grammar_notes', 'notes', 'image_asset_id', 'is_favorite', 'created_at', 'updated_at', 'introduced_at'],
   entry_meanings: ['id', 'entry_id', 'text', 'position'],
   entry_examples: ['id', 'entry_id', 'korean', 'translation', 'position'],
   entry_tags: ['entry_id', 'tag'],
+  acquisition: ['entry_id', 'direction', 'phase', 'errors', 'updated_at'],
   review_cards: ['id', 'entry_id', 'skill', 'due', 'stability', 'difficulty', 'elapsed_days', 'scheduled_days', 'learning_steps', 'reps', 'lapses', 'state', 'last_review'],
   practice_sessions: ['id', 'mode', 'dictionary_ids', 'started_at', 'finished_at', 'total', 'correct'],
   review_history: ['id', 'entry_id', 'skill', 'session_id', 'rating', 'state', 'due', 'stability', 'difficulty', 'elapsed_days', 'scheduled_days', 'reviewed_at', 'duration_ms'],
-  practice_attempts: ['id', 'session_id', 'entry_id', 'skill', 'mode', 'is_correct', 'rating', 'answer_given', 'hints_used', 'duration_ms', 'created_at'],
+  practice_attempts: ['id', 'session_id', 'entry_id', 'skill', 'mode', 'is_correct', 'rating', 'answer_given', 'hints_used', 'duration_ms', 'created_at', 'self_accepted'],
   user_preferences: ['key', 'value'],
 };
 

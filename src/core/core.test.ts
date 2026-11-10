@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { canonical, checkAnswer, diffAnswer } from './answer';
+import { canonical, checkAnswer, checkMeaning, diffAnswer, editDistance } from './answer';
+import { pickOptions, sameSyllableCount } from './options';
 import { countSyllables, normalizeHangul, romanize, toJamo } from './hangul';
 import { detectDelimiter, parseDelimited, parseWordList, serializeWordList } from './importer';
 import { formatInterval, mastery, newCard, previewDue, Rating, recallProbability, reviewCard, State } from './scheduler';
@@ -159,5 +160,47 @@ describe('punctuation handling', () => {
     expect(canonical('“집”…(home)')).toBe('집home');
     expect(canonical('3시！')).toBe('3시');
     expect(canonical('é ñ ü')).toBe('éñü');
+  });
+});
+
+describe('translation answers (Korean → meaning)', () => {
+  it('accepts any stored meaning, its parts and forms without brackets', () => {
+    const m = ['дерево', 'древесина (материал)', 'to grow, to raise'];
+    for (const ok of ['Дерево', ' дерево. ', 'древесина', 'древесина (материал)', 'grow', 'to raise', 'raise']) {
+      expect(checkMeaning(ok, m)).toMatchObject({ correct: true, typo: false });
+    }
+    expect(checkMeaning('ёлка', ['елка'])).toMatchObject({ correct: true, typo: false });
+  });
+  it('accepts one typo in longer words and says so', () => {
+    expect(checkMeaning('шокла', ['школа'])).toMatchObject({ correct: true, typo: true, expected: 'школа' });
+    expect(checkMeaning('яблокл', ['яблоко'])).toMatchObject({ correct: true, typo: true });
+  });
+  it('does not accept typos in short words, two typos, or a different word', () => {
+    expect(checkMeaning('дон', ['дом']).correct).toBe(false);
+    expect(checkMeaning('шкала', ['школа']).correct).toBe(true); // one substitution
+    expect(checkMeaning('шкалаа', ['школа']).correct).toBe(false);
+    expect(checkMeaning('вода', ['дерево']).correct).toBe(false);
+    expect(checkMeaning('', ['дерево'])).toEqual({ correct: false, typo: false, expected: 'дерево' });
+  });
+  it('measures edit distance with swaps', () => {
+    expect(editDistance('школа', 'шкoла'.replace('o', 'о'))).toBe(0);
+    expect(editDistance('школа', 'шокла')).toBe(1);
+    expect(editDistance('дом', 'домик')).toBe(2);
+  });
+});
+
+describe('multiple-choice options', () => {
+  it('gives the right answer plus distinct wrong ones, never another form of the right answer', () => {
+    const o = pickOptions({ correct: 'дерево', alsoRight: ['дерево', 'tree'], pool: ['вода', 'Дерево', 'tree', 'школа', 'вода ', 'дом', ''], count: 4 }) as string[];
+    expect([...o].sort()).toEqual(['вода', 'дерево', 'дом', 'школа'].sort());
+  });
+  it('returns null when the pool is too small', () => {
+    expect(pickOptions({ correct: 'дерево', alsoRight: [], pool: ['вода', 'вода'], count: 4 })).toBeNull();
+  });
+  it('prefers Korean words of the same length', () => {
+    for (let i = 0; i < 20; i++) {
+      const o = pickOptions({ correct: '나무', alsoRight: ['나무'], pool: ['고양이', '물', '학교', '사과', '선생님', '집', '우유'], count: 4, similar: sameSyllableCount('나무') }) as string[];
+      expect([...o].sort()).toEqual(['나무', '사과', '우유', '학교'].sort());
+    }
   });
 });

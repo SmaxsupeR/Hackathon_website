@@ -1,7 +1,7 @@
 import { useRouter } from 'expo-router';
 import { StyleSheet, Text, View } from 'react-native';
-import { getOverview, getQueueCounts, listDictionaries } from '../../db/repo';
-import { useApp } from '../../state/store';
+import { getOverview, getPlanCounts, listDictionaries } from '../../db/repo';
+import { directionList, useApp } from '../../state/store';
 import { Bar, Body, Btn, Card, Empty, Icon, IconBtn, Row, Screen, Section, Title } from '../../ui/components';
 import { useT, type StringKey } from '../../ui/i18n';
 import { space, useTheme } from '../../ui/theme';
@@ -23,11 +23,11 @@ export default function Home() {
     const now = Date.now();
     const [overview, counts, dictionaries] = await Promise.all([
       getOverview(db, now),
-      getQueueCounts(db, { dictionaryIds: [], skill: 'recall', now, newPerDay: settings.newPerDay, maxReviews: settings.maxReviews }),
+      getPlanCounts(db, { dictionaryIds: [], directions: directionList(settings.directions), now, newPerDay: settings.newPerDay, maxReviews: settings.maxReviews }),
       listDictionaries(db, now),
     ]);
     return { overview, counts, dictionaries };
-  }, [settings.newPerDay, settings.maxReviews]);
+  }, [settings.newPerDay, settings.maxReviews, settings.directions]);
 
   const header = (
     <Row style={styles.header}>
@@ -53,8 +53,8 @@ export default function Home() {
     );
   }
 
-  const todo = counts.due + counts.fresh;
-  const goal = overview.reviewsToday + todo;
+  const todo = counts.due + counts.learning + counts.fresh;
+  const lines = [counts.learning > 0 && tr('planLearning', { n: counts.learning }), counts.fresh > 0 && tr('planFresh', { n: counts.fresh })].filter(Boolean) as string[];
   return (
     <Screen top>
       {header}
@@ -62,9 +62,11 @@ export default function Home() {
         <Text style={[styles.cardLabel, { color: t.primary }]}>{tr('todayTitle')}</Text>
         {todo > 0 ? (
           <>
-            <Text style={[styles.big, { color: t.text }]}>{counts.due > 0 ? tr('toReview', { n: counts.due }) : tr('newAvailable', { n: counts.fresh })}</Text>
-            {counts.due > 0 && counts.fresh > 0 ? <Body dim>{`+ ${tr('newAvailable', { n: counts.fresh })}`}</Body> : null}
-            <Btn title={tr('startReview')} icon="play" onPress={() => router.push('/study?mode=cards')} style={styles.gapTop} />
+            <Text style={[styles.big, { color: t.text }]}>{counts.due > 0 ? tr('planDue', { n: counts.due }) : (lines.shift() as string)}</Text>
+            {lines.map((l) => (
+              <Body key={l} dim>{`+ ${l}`}</Body>
+            ))}
+            <Btn title={tr('startReview')} icon="play" onPress={() => router.push('/study')} style={styles.gapTop} />
           </>
         ) : (
           <>
@@ -84,8 +86,9 @@ export default function Home() {
             </Row>
           ) : null}
         </Row>
-        <Text style={[styles.medium, { color: t.text }]}>{tr('answers', { n: overview.reviewsToday })}</Text>
-        <Bar value={goal > 0 ? overview.reviewsToday / goal : 0} />
+        <Text style={[styles.medium, { color: t.text }]}>{tr('answers', { n: overview.answersToday })}</Text>
+        {overview.newToday > 0 ? <Body dim>{tr('planFresh', { n: overview.newToday })}</Body> : null}
+        <Bar value={todo === 0 ? 1 : overview.answersToday / (overview.answersToday + todo * 3)} />
       </Card>
 
       <Row style={styles.tiles}>

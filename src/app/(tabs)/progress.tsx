@@ -1,12 +1,12 @@
 import { StyleSheet, Text, View } from 'react-native';
-import { getAccuracyBySkill, getDailyActivity, getForecast, getHardestWords, getOverview } from '../../db/repo';
+import { getAccuracy, getDailyActivity, getForecast, getHardestWords, getOverview, type AccuracyKind } from '../../db/repo';
 import { useApp } from '../../state/store';
 import { Bar, Body, Card, Empty, Row, Screen, Section, Title } from '../../ui/components';
 import { useT, WEEKDAYS, type StringKey, type T } from '../../ui/i18n';
 import { space, useTheme } from '../../ui/theme';
 import { useLoad } from '../../ui/useLoad';
 
-const SKILL_LABEL: Record<string, StringKey> = { recall: 'skillRecall', typing: 'skillTyping', listening: 'skillListening', handwriting: 'skillHandwriting' };
+const ACCURACY_LABEL: Record<AccuracyKind, StringKey> = { recognition: 'accRecognition', ko_ru: 'accKoRu', ru_ko: 'accRuKo' };
 
 function duration(tr: T, ms: number): string {
   const minutes = Math.round(ms / 60000);
@@ -23,7 +23,7 @@ export default function Progress() {
       getOverview(db, now),
       getDailyActivity(db, now, 7),
       getForecast(db, now, 7),
-      getAccuracyBySkill(db),
+      getAccuracy(db),
       getHardestWords(db, 8),
     ]);
     return { overview, activity, forecast, accuracy, hardest };
@@ -42,7 +42,7 @@ export default function Progress() {
   return (
     <Screen top>
       <Title>{tr('tabProgress')}</Title>
-      {o.totalReviews === 0 ? <Empty icon="chart-line" title={tr('noStats')} /> : null}
+      {o.totalAnswers === 0 ? <Empty icon="chart-line" title={tr('noStats')} /> : null}
 
       <Card>
         <Row style={styles.between}>
@@ -57,19 +57,19 @@ export default function Progress() {
           </View>
         ) : null}
         <Legend color={t.primary} label={tr('statStable')} hint={tr('statStableHint')} value={o.stableWords} />
-        <Legend color={t.info} label={tr('statLearning')} value={o.learningWords} />
+        <Legend color={t.info} label={tr('statLearning')} hint={tr('statLearningHint')} value={o.learningWords} />
         <Legend color={t.textDim} label={tr('statNew')} value={o.newWords} />
       </Card>
 
       <Row style={styles.tiles}>
-        <Tile label={tr('statReviews')} value={String(o.totalReviews)} />
+        <Tile label={tr('statReviews')} value={String(o.totalAnswers)} />
         <Tile label={tr('statTime')} value={duration(tr, o.totalMs)} />
         <Tile label={tr('statStreak')} value={tr('streak', { n: o.streakDays }).split(' ').slice(0, 2).join(' ')} />
       </Row>
 
       <Section>{tr('activity')}</Section>
       <Card>
-        <Chart items={activity.map((d) => ({ label: weekday(d.day), value: d.reviews }))} color={t.primary} />
+        <Chart items={activity.map((d) => ({ label: weekday(d.day), value: d.answers }))} color={t.primary} />
       </Card>
 
       <Section>{tr('forecast')}</Section>
@@ -82,9 +82,9 @@ export default function Progress() {
           <Section>{tr('accuracy')}</Section>
           <Card>
             {accuracy.map((a) => (
-              <View key={a.skill} style={styles.accuracy}>
+              <View key={a.kind} style={styles.accuracy}>
                 <Row style={styles.between}>
-                  <Text style={{ color: t.text, fontWeight: '600' }}>{tr(SKILL_LABEL[a.skill] ?? 'skillRecall')}</Text>
+                  <Text style={{ color: t.text, fontWeight: '600' }}>{tr(ACCURACY_LABEL[a.kind])}</Text>
                   <Text style={{ color: t.textDim }}>{`${Math.round((a.correct / a.total) * 100)}% · ${a.total}`}</Text>
                 </Row>
                 <Bar value={a.correct / a.total} />
@@ -104,7 +104,7 @@ export default function Progress() {
               <Text style={[styles.word, { color: t.text }]}>{w.korean}</Text>
               <Body dim>{w.meaning ?? ''}</Body>
             </View>
-            <Text style={{ color: t.danger, fontWeight: '600' }}>{tr('lapses', { n: w.lapses })}</Text>
+            <Text style={{ color: t.danger, fontWeight: '600' }}>{tr('lapses', { n: w.mistakes })}</Text>
           </Row>
         ))}
       </Card>

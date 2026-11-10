@@ -3,8 +3,11 @@ import { createEmptyCard, fsrs, generatorParameters, Rating, State, type Card, t
 
 export { Rating, State };
 
-/** Each skill is scheduled separately: recognising a word is not the same as writing it. */
-export type Skill = 'recall' | 'typing' | 'listening' | 'handwriting';
+/**
+ * Each skill is scheduled separately. ko_ru: recall the meaning of a Korean word;
+ * ru_ko: produce the Korean word. Listening and handwriting are planned.
+ */
+export type Skill = 'ko_ru' | 'ru_ko' | 'listening' | 'handwriting';
 
 export interface CardState {
   due: number;
@@ -38,9 +41,11 @@ export const GRADES: Grade[] = [Rating.Again, Rating.Hard, Rating.Good, Rating.E
 /** A card counts as firmly remembered once its memory stability reaches this many days. */
 export const STABLE_DAYS = 21;
 
+// The app trains new and forgotten words itself inside a session, so FSRS's own
+// minute-level learning steps are switched off: every rating moves the card by days.
 function scheduler(retention: number) {
   const r = Math.min(0.97, Math.max(0.7, retention));
-  return fsrs(generatorParameters({ request_retention: r, enable_fuzz: true }));
+  return fsrs(generatorParameters({ request_retention: r, enable_fuzz: true, learning_steps: [], relearning_steps: [] }));
 }
 
 function toFsrs(c: CardState): Card {

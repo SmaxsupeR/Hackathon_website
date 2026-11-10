@@ -1,44 +1,39 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Alert, BackHandler, KeyboardAvoidingView, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import type { Grade } from 'ts-fsrs';
-import { checkAnswer, type CheckResult } from '../core/answer';
-import { newCard, previewDue, Rating, type CardState, type Skill } from '../core/scheduler';
-import { buildSteps, insertAfter, pickOptions, type Step } from '../core/session';
+import { checkAnswer, checkMeaning, type DiffPart } from '../core/answer';
+import { answer, cardKey, completeIntro, createSession, currentTask, progress, type Card as LearnCard, type Direction, type Effect, type Session, type Task } from '../core/learning';
+import { pickOptions, sameSyllableCount } from '../core/options';
 import { getDb } from '../db';
-import { finishSession, getRandomMeanings, getStudyQueue, recordReview, startSession, type Entry, type StudyItem } from '../db/repo';
+import { applyEffects, finishSession, getDistractorPool, getEntries, planSession, startSession, type Entry } from '../db/repo';
 import { speakKorean } from '../services/speech';
-import { useApp } from '../state/store';
+import { directionList, useApp } from '../state/store';
 import { Bar, Body, Btn, Card, Empty, Icon, IconBtn, Row } from '../ui/components';
-import { useInterval, useT, type StringKey } from '../ui/i18n';
+import { useInterval, useT } from '../ui/i18n';
 import { radius, space, useTheme } from '../ui/theme';
 
-type Mode = 'cards' | 'typing';
-type Tone = 'danger' | 'warn' | 'primary' | 'info';
+/** What the learner sees after answering, before tapping "Next". */
+interface Feedback {
+  correct: boolean;
+  typo?: boolean;
+  dontKnow?: boolean;
+  given?: string;
+  picked?: string;
+  diff?: DiffPart[];
+  /** Days until the next FSRS review, if this answer rated the card. */
+  nextDueMs?: number;
+  /** Stage of the card after the answer: requeued, parked, done. */
+  after?: LearnCard['stage'];
+  graduated?: boolean;
+  /** A wrong translation that the learner may still claim as right. Not saved yet. */
+  pendingWrong?: boolean;
+}
 
-const DETAILED: { grade: Grade; key: StringKey; tone: Tone }[] = [
-  { grade: Rating.Again, key: 'again', tone: 'danger' },
-  { grade: Rating.Hard, key: 'hard', tone: 'warn' },
-  { grade: Rating.Good, key: 'good', tone: 'primary' },
-  { grade: Rating.Easy, key: 'easy', tone: 'info' },
-];
-const SIMPLE: typeof DETAILED = [
-  { grade: Rating.Again, key: 'again', tone: 'danger' },
-  { grade: Rating.Good, key: 'remember', tone: 'primary' },
-];
-
-/** New words are introduced this many at a time. */
-const BATCH = 4;
-/** A missed question comes back after this many other steps. */
-const RETRY_GAP = 3;
-
-const meaningOf = (e: Entry) => e.meanings.join('; ');
+const meaningText = (e: Entry) => e.meanings.join('; ');
 
 export default function Study() {
-  const params = useLocalSearchParams<{ mode?: string; dicts?: string }>();
-  const mode: Mode = params.mode === 'typing' ? 'typing' : 'cards';
-  const skill: Skill = mode === 'typing' ? 'typing' : 'recall';
+  const params = useLocalSearchParams<{ dicts?: string }>();
   const dicts = (params.dicts ?? '').split(',').filter(Boolean);
 
   const t = useTheme();
@@ -49,55 +44,177 @@ export default function Study() {
   const settings = useApp((s) => s.settings);
   const touch = useApp((s) => s.touch);
 
-  const [steps, setSteps] = useState<Step<StudyItem>[] | null>(null);
-  const [total, setTotal] = useState(0);
-  const [done, setDone] = useState(0);
-  const [stats, setStats] = useState({ answers: 0, correct: 0 });
-  const [revealed, setRevealed] = useState(false);
+  const [session, setSession] = useState<Session | null>(null);
+  const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [typed, setTyped] = useState('');
-  const [result, setResult] = useState<CheckResult | null>(null);
-  const [picked, setPicked] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const entries = useRef(new Map<string, Entry>());
   const options = useRef(new Map<string, string[]>());
   const sessionId = useRef<string | null>(null);
   const startedAt = useRef(Date.now());
   const shownAt = useRef(Date.now());
+  const pending = useRef<{ session: Session; given: string } | null>(null);
 
+  // Build the session once, when the screen opens.
   useEffect(() => {
     (async () => {
       const db = await getDb();
       const now = Date.now();
-      const items = await getStudyQueue(db, { dictionaryIds: dicts, skill, now, newPerDay: settings.newPerDay, maxReviews: settings.maxReviews });
-      if (items.length > 0) sessionId.current = await startSession(db, mode, dicts, now);
-      const pool = [...items.map((i) => i.entry.meanings[0] ?? ''), ...(await getRandomMeanings(db, 40))];
-      for (const { entry, isNew } of items) {
-        if (!isNew) continue;
-        const choice = pickOptions(meaningOf(entry), entry.meanings, pool, 4);
-        if (choice) options.current.set(entry.id, choice);
+      const directions = directionList(settings.directions);
+      const plan = await planSession(db, { dictionaryIds: dicts, directions, now, newPerDay: settings.newPerDay, maxReviews: settings.maxReviews });
+      const ids = [...new Set([...plan.reviews.map((r) => r.entryId), ...plan.learning.map((l) => l.entryId), ...plan.fresh])];
+      entries.current = await getEntries(db, ids);
+      const pool = [...entries.current.values()].map((e) => ({ korean: e.korean, meaning: e.meanings[0] ?? '' }));
+      pool.push(...(await getDistractorPool(db, 80)));
+      for (const e of entries.current.values()) {
+        const koRu = pickOptions({ correct: e.meanings[0] ?? '', alsoRight: e.meanings, pool: pool.map((p) => p.meaning), count: 4 });
+        if (koRu) options.current.set(cardKey(e.id, 'ko_ru'), koRu);
+        const ruKo = pickOptions({ correct: e.korean, alsoRight: [e.korean], pool: pool.map((p) => p.korean), count: 4, similar: sameSyllableCount(e.korean) });
+        if (ruKo) options.current.set(cardKey(e.id, 'ru_ko'), ruKo);
       }
-      const built = buildSteps(items, { batchSize: BATCH, hasChoice: (i) => options.current.has(i.entry.id) });
-      setSteps(built);
-      setTotal(built.length);
+      const s = createSession({ ...plan, directions, hasChoice: (id, d) => options.current.has(cardKey(id, d)) });
+      if (s.queue.length > 0) sessionId.current = await startSession(db, 'learn', dicts, now);
       shownAt.current = Date.now();
+      setSession(s);
     })().catch((e: unknown) => Alert.alert(tr('error'), e instanceof Error ? e.message : String(e)));
-    // The session is built once, when the screen opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const current = steps && steps.length > 0 ? steps[0] : null;
-  const finished = steps !== null && steps.length === 0;
+  const task = session ? currentTask(session) : null;
+  const entry = task ? entries.current.get(task.kind === 'intro' ? task.entryId : (session as Session).cards[task.key].entryId) : undefined;
+  const card = task && task.kind !== 'intro' ? (session as Session).cards[task.key] : undefined;
+
+  const speak = useCallback(
+    async (text: string, quiet = false) => {
+      const ok = await speakKorean(text);
+      if (!ok && !quiet) Alert.alert(tr('noVoiceTitle'), tr('noVoiceText'));
+    },
+    [tr],
+  );
+
+  // Pronounce a new word as soon as it is shown.
+  useEffect(() => {
+    if (task?.kind === 'intro' && entry && settings.autoSpeak) speak(entry.korean, true);
+  }, [task, entry, settings.autoSpeak, speak]);
+
+  const save = async (effects: Effect[], extra: { given?: string; selfAccepted?: boolean } = {}) => {
+    const now = Date.now();
+    return applyEffects(await getDb(), effects, {
+      now,
+      retention: settings.retention,
+      sessionId: sessionId.current,
+      durationMs: Math.min(now - shownAt.current, 120000),
+      answerGiven: extra.given ?? null,
+      selfAccepted: extra.selfAccepted,
+    });
+  };
+
+  const fail = (e: unknown) => Alert.alert(tr('error'), e instanceof Error ? e.message : String(e));
+
+  /** Runs one step of the state machine and saves it. The screen keeps showing this question until "Next". */
+  const commit = async (correct: boolean, view: Feedback, extra: { given?: string; selfAccepted?: boolean } = {}) => {
+    if (!session) return;
+    setBusy(true);
+    try {
+      const step = answer(session, correct);
+      const scheduled = await save(step.effects, extra);
+      const graduated = step.effects.some((e) => e.type === 'graduate');
+      pending.current = null;
+      setFeedback({ ...view, correct, after: step.card.stage, graduated, nextDueMs: scheduled ? scheduled.due - Date.now() : undefined, pendingWrong: false });
+      setSession(step.session);
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // The question on screen stays until "Next", even though the session already moved on.
+  const [shown, setShown] = useState<{ task: Task; entry: Entry; card?: LearnCard } | null>(null);
+  useEffect(() => {
+    if (!feedback && task && entry) setShown({ task, entry, card });
+  }, [feedback, task, entry, card]);
+
+  const goNext = async () => {
+    // A wrong translation not claimed as right is saved now.
+    if (feedback?.pendingWrong && pending.current) {
+      await commit(false, { ...feedback, pendingWrong: false }, { given: pending.current.given });
+    }
+    setFeedback(null);
+    setTyped('');
+    shownAt.current = Date.now();
+  };
+
+  const finishIntro = async () => {
+    if (!session) return;
+    setBusy(true);
+    try {
+      const step = completeIntro(session);
+      await save(step.effects);
+      setSession(step.session);
+      shownAt.current = Date.now();
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const choose = (option: string) => {
+    if (!shown || !card || feedback || busy) return;
+    const e = shown.entry;
+    const right = card.direction === 'ko_ru' ? e.meanings.map((m) => m.trim().toLowerCase()).includes(option.trim().toLowerCase()) : option === e.korean;
+    commit(right, { correct: right, picked: option });
+    if (settings.autoSpeak) speak(e.korean, true);
+  };
+
+  const submit = (dontKnow = false) => {
+    if (!shown || !card || feedback || busy) return;
+    const e = shown.entry;
+    const given = dontKnow ? '' : typed;
+    if (!dontKnow && given.trim() === '') return;
+    if (settings.autoSpeak) speak(e.korean, true);
+    if (card.direction === 'ru_ko') {
+      const r = checkAnswer(given, [e.korean], { ignoreSpaces: !settings.strictSpacing, ignorePunctuation: true });
+      commit(r.correct, { correct: r.correct, dontKnow, given, diff: dontKnow ? undefined : r.diff }, { given });
+      return;
+    }
+    const r = checkMeaning(given, e.meanings);
+    if (r.correct || dontKnow) {
+      commit(r.correct, { correct: r.correct, typo: r.typo, dontKnow, given }, { given });
+      return;
+    }
+    // A translation can be right in words the dictionary does not list: let the learner say so before saving.
+    pending.current = { session: session as Session, given };
+    setFeedback({ correct: false, given, pendingWrong: true });
+  };
+
+  const acceptMine = () => {
+    if (!feedback?.pendingWrong || !pending.current) return;
+    const given = pending.current.given;
+    commit(true, { correct: true, given }, { given, selfAccepted: true });
+  };
 
   const close = useCallback(async () => {
     try {
-      if (sessionId.current) await finishSession(await getDb(), sessionId.current);
+      const db = await getDb();
+      if (pending.current && session) {
+        // Leaving with an unconfirmed wrong translation counts it as wrong.
+        const step = answer(pending.current.session, false);
+        await applyEffects(db, step.effects, { now: Date.now(), retention: settings.retention, sessionId: sessionId.current, answerGiven: pending.current.given });
+        pending.current = null;
+      }
+      if (sessionId.current) await finishSession(db, sessionId.current);
+    } catch {
+      // Everything answered before this point is already saved.
     } finally {
       touch();
       router.back();
     }
-  }, [router, touch]);
+  }, [router, touch, session, settings.retention]);
 
   const askLeave = useCallback(() => {
-    if (finished || done === 0) {
+    if (!session || session.queue.length === 0 || session.stats.answers + session.stats.introduced === 0) {
       close();
       return true;
     }
@@ -106,118 +223,48 @@ export default function Study() {
       { text: tr('leave'), onPress: close },
     ]);
     return true;
-  }, [finished, done, close, tr]);
+  }, [session, close, tr]);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', askLeave);
     return () => sub.remove();
   }, [askLeave]);
 
-  useEffect(() => {
-    if (finished && sessionId.current) {
-      getDb()
-        .then((db) => finishSession(db, sessionId.current as string))
-        .then(touch)
-        .catch(() => {});
-    }
-  }, [finished, touch]);
-
-  const speak = async (text: string) => {
-    if (!(await speakKorean(text))) Alert.alert(tr('noVoiceTitle'), tr('noVoiceText'));
-  };
-
-  /** Leaves the current step. With `retry`, that step comes back a little later. */
-  const next = (retry?: Step<StudyItem>) => {
-    setSteps((q) => {
-      if (!q) return q;
-      const rest = q.slice(1);
-      return retry ? insertAfter(rest, retry, RETRY_GAP) : rest;
-    });
-    if (!retry) setDone((n) => n + 1);
-    setRevealed(false);
-    setTyped('');
-    setResult(null);
-    setPicked(null);
-    shownAt.current = Date.now();
-  };
-
-  /** Saves a test answer and returns the step to repeat if the word was not recalled. */
-  const record = async (step: Step<StudyItem>, grade: Grade, given?: string): Promise<Step<StudyItem> | undefined> => {
-    const now = Date.now();
-    const card: CardState = await recordReview(await getDb(), {
-      entryId: step.item.entry.id,
-      skill,
-      mode,
-      rating: grade,
-      now,
-      retention: settings.retention,
-      sessionId: sessionId.current,
-      durationMs: Math.min(now - shownAt.current, 120000),
-      answerGiven: given ?? null,
-    });
-    setStats((s) => ({ answers: s.answers + 1, correct: s.correct + (grade > Rating.Again ? 1 : 0) }));
-    return grade === Rating.Again ? { kind: 'test', item: { entry: { ...step.item.entry, card }, isNew: false } } : undefined;
-  };
-
-  const retryStep = useRef<Step<StudyItem> | undefined>(undefined);
-
-  const rate = async (grade: Grade) => {
-    if (!current || saving) return;
-    setSaving(true);
-    try {
-      next(await record(current, grade));
-    } catch (e) {
-      Alert.alert(tr('error'), e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const submitTyped = async () => {
-    if (!current || result || saving || typed.trim() === '') return;
-    const r = checkAnswer(typed, [current.item.entry.korean], { ignoreSpaces: !settings.strictSpacing, ignorePunctuation: true });
-    setResult(r);
-    setSaving(true);
-    try {
-      retryStep.current = await record(current, r.correct ? Rating.Good : Rating.Again, typed);
-    } catch (e) {
-      Alert.alert(tr('error'), e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const pick = (option: string) => {
-    if (!current || picked !== null) return;
-    setPicked(option);
-  };
-
   const header = (
     <Row style={[styles.header, { paddingTop: insets.top + space.sm }]}>
       <IconBtn name="close" label={tr('leave')} onPress={askLeave} />
       <View style={styles.flex}>
-        <Bar value={total > 0 ? done / total : 0} />
+        <Bar value={session ? progress(session) : 0} />
       </View>
     </Row>
   );
 
-  if (steps === null) return <View style={[styles.flex, { backgroundColor: t.bg }]}>{header}</View>;
+  if (!session) return <View style={[styles.flex, { backgroundColor: t.bg }]}>{header}</View>;
 
-  if (!current) {
+  // ---------- Finished ----------
+  if (!task && !feedback) {
+    const st = session.stats;
     const minutes = Math.max(1, Math.round((Date.now() - startedAt.current) / 60000));
+    const empty = st.answers === 0 && st.introduced === 0;
     return (
       <View style={[styles.flex, { backgroundColor: t.bg, paddingBottom: insets.bottom + space.lg }]}>
         {header}
-        <View style={styles.body}>
-          {total === 0 ? <Empty icon="calendar-check" title={tr('nothingToStudy')} text={tr('nothingToStudyText')} /> : <Empty icon="party-popper" title={tr('sessionDone')} />}
-          {stats.answers > 0 ? (
-            <Row style={styles.summary}>
-              <Summary label={tr('sessionAnswers')} value={String(stats.answers)} />
-              <Summary label={tr('sessionCorrect')} value={`${Math.round((stats.correct / stats.answers) * 100)}%`} />
-              <Summary label={tr('sessionTime')} value={tr('minutes', { n: minutes })} />
-            </Row>
+        <ScrollView contentContainerStyle={styles.body}>
+          {empty ? <Empty icon="calendar-check" title={tr('nothingToStudy')} text={tr('nothingToStudyText')} /> : <Empty icon="party-popper" title={tr('sessionDone')} />}
+          {!empty ? (
+            <View style={styles.summary}>
+              <Row style={styles.summaryRow}>
+                <Summary label={tr('sumIntroduced')} value={String(st.introduced)} />
+                <Summary label={tr('sumLearned')} value={String(st.learnedWords.length)} />
+                <Summary label={tr('sumReviewed')} value={st.reviewed > 0 ? `${st.reviewCorrect}/${st.reviewed}` : '0'} />
+              </Row>
+              <Row style={styles.summaryRow}>
+                <Summary label={tr('sumAccuracy')} value={st.answers > 0 ? `${Math.round((st.correct / st.answers) * 100)}%` : '—'} />
+                <Summary label={tr('sessionTime')} value={tr('minutes', { n: minutes })} />
+              </Row>
+            </View>
           ) : null}
-        </View>
+        </ScrollView>
         <View style={styles.footer}>
           <Btn title={tr('finish')} onPress={close} />
         </View>
@@ -225,177 +272,157 @@ export default function Study() {
     );
   }
 
-  const { kind } = current;
-  const entry = current.item.entry;
-  const meaning = meaningOf(entry);
-  const reading = settings.showRomanization ? entry.transcription || entry.romanization : null;
-  const koreanFirst = mode === 'cards' && settings.cardDirection === 'ko-first';
-  const answered = mode === 'cards' ? revealed : result !== null;
+  const view = feedback ? shown : task && entry ? { task, entry, card } : null;
+  if (!view) return <View style={[styles.flex, { backgroundColor: t.bg }]}>{header}</View>;
+  const e = view.entry;
+  const reading = e.transcription || e.romanization;
 
-  const koreanBlock = (
+  const korean = (big = true, listen = true) => (
     <View style={styles.centered}>
-      <Row>
-        <Text style={[styles.korean, { color: t.text }]}>{entry.korean}</Text>
-        <IconBtn name="volume-high" label={tr('listen')} color={t.primary} onPress={() => speak(entry.korean)} />
+      <Row style={styles.wrapRow}>
+        <Text style={[big ? styles.korean : styles.koreanSmall, { color: t.text }]}>{e.korean}</Text>
+        {listen ? <IconBtn name="volume-high" label={tr('listen')} color={t.primary} onPress={() => speak(e.korean)} /> : null}
       </Row>
-      {reading ? <Text style={[styles.reading, { color: t.textDim }]}>{reading}</Text> : null}
+      {settings.showRomanization && reading ? <Text style={[styles.reading, { color: t.textDim }]}>{e.transcription ? reading : `≈ ${reading}`}</Text> : null}
     </View>
   );
-  const meaningBlock = <Text style={[styles.meaning, { color: t.text }]}>{meaning}</Text>;
+  const meaning = <Text style={[styles.meaning, { color: t.text }]}>{meaningText(e)}</Text>;
   const divider = <View style={[styles.divider, { backgroundColor: t.border }]} />;
-  const extras = (
-    <>
-      {entry.example ? (
-        <View style={styles.centered}>
-          <Text style={[styles.example, { color: t.text }]}>{entry.example}</Text>
-          {entry.exampleTranslation ? <Body dim>{entry.exampleTranslation}</Body> : null}
-        </View>
-      ) : null}
-      {entry.notes ? <Body dim>{entry.notes}</Body> : null}
-    </>
-  );
+  const example = e.example ? (
+    <View style={styles.centered}>
+      <Text style={[styles.example, { color: t.text }]}>{e.example}</Text>
+      {e.exampleTranslation ? <Body dim>{e.exampleTranslation}</Body> : null}
+    </View>
+  ) : null;
 
-  let hint: string;
-  let content: React.ReactNode;
-  let footer: React.ReactNode;
+  let title = '';
+  let badge: string | null = null;
+  let content: ReactNode = null;
+  let footer: ReactNode = null;
 
-  if (kind === 'intro') {
-    hint = tr('introHint');
-    content = (
-      <Card style={styles.card}>
-        <View style={[styles.badge, { backgroundColor: t.infoSoft }]}>
-          <Text style={[styles.badgeText, { color: t.info }]}>{tr('introTitle')}</Text>
-        </View>
-        {koreanBlock}
-        {divider}
-        {meaningBlock}
-        {extras}
-      </Card>
-    );
-    footer = <Btn title={tr('gotIt')} onPress={() => next()} />;
-  } else if (kind === 'choice') {
-    const correct = meaning;
-    hint = tr('chooseTranslation');
+  // ---------- Intro ----------
+  if (view.task.kind === 'intro') {
+    title = view.task.repeat ? tr('stepIntroAgain') : tr('stepIntro');
     content = (
       <>
-        <Card style={styles.card}>{koreanBlock}</Card>
-        {(options.current.get(entry.id) ?? [correct]).map((option) => {
-          const isCorrect = option === correct;
-          const show = picked !== null && (isCorrect || option === picked);
-          const color = show ? (isCorrect ? t.primary : t.danger) : t.border;
-          return (
-            <Pressable
-              key={option}
-              onPress={() => pick(option)}
-              disabled={picked !== null}
-              accessibilityRole="button"
-              accessibilityLabel={option}
-              android_ripple={{ color: t.surfaceAlt }}
-              style={[styles.option, { borderColor: color, backgroundColor: show ? (isCorrect ? t.primarySoft : t.dangerSoft) : t.surface }]}>
-              <Text style={[styles.optionText, { color: t.text }]}>{option}</Text>
-              {show ? <Icon name={isCorrect ? 'check-circle' : 'close-circle'} color={color} /> : null}
-            </Pressable>
-          );
-        })}
+        <Body dim style={styles.center}>
+          {tr('introHint')}
+        </Body>
+        <Card style={styles.card}>
+          {korean()}
+          {!settings.showRomanization && reading ? <Text style={[styles.reading, { color: t.textDim }]}>{e.transcription ? reading : `≈ ${reading}`}</Text> : null}
+          {divider}
+          {meaning}
+          {example}
+          {e.notes ? <Body dim>{e.notes}</Body> : null}
+        </Card>
       </>
     );
-    // A wrong pick brings the same question back a few steps later.
-    footer = picked !== null ? <Btn title={tr('next')} onPress={() => next(picked === correct ? undefined : current)} /> : null;
-  } else if (mode === 'cards') {
-    const preview = previewDue(entry.card ?? newCard(Date.now()), Date.now(), settings.retention);
-    const ratings = settings.detailedGrading ? DETAILED : SIMPLE;
-    hint = koreanFirst ? tr('recallHint') : tr('recallHintReverse');
-    content = (
-      <Card style={styles.card}>
-        {koreanFirst ? koreanBlock : meaningBlock}
-        {revealed ? (
-          <>
-            {divider}
-            {koreanFirst ? meaningBlock : koreanBlock}
-            {extras}
-          </>
-        ) : null}
-      </Card>
-    );
-    footer = !revealed ? (
-      <Btn title={tr('showAnswer')} onPress={() => setRevealed(true)} />
-    ) : (
-      <Row style={styles.ratings}>
-        {ratings.map((r) => (
-          <RatingBtn key={r.grade} label={tr(r.key)} hint={tr('nextIn', { t: interval(preview[r.grade] - Date.now()) })} tone={r.tone} disabled={saving} onPress={() => rate(r.grade)} />
-        ))}
-      </Row>
-    );
+    footer = <Btn title={tr('next')} disabled={busy} onPress={finishIntro} />;
   } else {
-    hint = tr('typeKorean');
-    content = (
-      <>
-        <Card style={styles.card}>
-          {meaningBlock}
-          {answered ? (
+    const c = view.card as LearnCard;
+    const dir: Direction = c.direction;
+    const purpose = view.task.kind === 'recall' ? view.task.purpose : null;
+    if (purpose === 'review') badge = tr('stepReview');
+    if (purpose === 'relearn') badge = tr('stepRelearn');
+
+    // ---------- Recognition ----------
+    if (view.task.kind === 'recognize') {
+      title = dir === 'ko_ru' ? tr('stepRecognizeKoRu') : tr('stepRecognizeRuKo');
+      const list = options.current.get(c.key) ?? [];
+      const isRight = (o: string) => (dir === 'ko_ru' ? e.meanings.includes(o) : o === e.korean);
+      content = (
+        <>
+          <Card style={styles.card}>{dir === 'ko_ru' ? korean() : meaning}</Card>
+          {list.map((o) => {
+            const reveal = feedback && (isRight(o) || o === feedback.picked);
+            const color = reveal ? (isRight(o) ? t.primary : t.danger) : t.border;
+            return (
+              <Pressable
+                key={o}
+                onPress={() => choose(o)}
+                disabled={!!feedback || busy}
+                accessibilityRole="button"
+                accessibilityLabel={o}
+                android_ripple={{ color: t.surfaceAlt }}
+                style={[styles.option, { borderColor: color, backgroundColor: reveal ? (isRight(o) ? t.primarySoft : t.dangerSoft) : t.surface }]}>
+                <Text style={[dir === 'ko_ru' ? styles.optionText : styles.optionKorean, { color: t.text }]}>{o}</Text>
+                {reveal ? <Icon name={isRight(o) ? 'check-circle' : 'close-circle'} color={color} /> : null}
+              </Pressable>
+            );
+          })}
+          {feedback ? (
             <>
-              {divider}
-              {koreanBlock}
-              {extras}
+              {dir === 'ru_ko' ? <Card style={styles.card}>{korean(false)}</Card> : null}
+              <Outcome feedback={feedback} interval={interval} />
             </>
           ) : null}
-        </Card>
-        {!result ? (
-          <TextInput
-            value={typed}
-            onChangeText={setTyped}
-            onSubmitEditing={submitTyped}
-            placeholder={tr('typeKorean')}
-            placeholderTextColor={t.textDim + '99'}
-            accessibilityLabel={tr('typeKorean')}
-            autoFocus
-            autoCorrect={false}
-            autoCapitalize="none"
-            returnKeyType="done"
-            submitBehavior="submit"
-            style={[styles.typeInput, { color: t.text, backgroundColor: t.surface, borderColor: t.border }]}
-          />
-        ) : (
-          <Card style={{ backgroundColor: result.correct ? t.primarySoft : t.dangerSoft, borderColor: 'transparent' }}>
-            <Text style={[styles.verdict, { color: result.correct ? t.primary : t.danger }]} accessibilityLiveRegion="polite">
-              {result.correct ? tr('correct') : tr('wrong')}
-            </Text>
-            {!result.correct ? (
+        </>
+      );
+      footer = feedback ? <Btn title={tr('next')} disabled={busy} onPress={goNext} /> : null;
+    } else {
+      // ---------- Recall (training, review or relearning) ----------
+      title = dir === 'ko_ru' ? tr('stepRecallKoRu') : tr('stepRecallRuKo');
+      content = (
+        <>
+          <Card style={styles.card}>
+            {dir === 'ko_ru' ? korean() : meaning}
+            {feedback ? (
               <>
-                <Text style={[styles.diffLabel, { color: t.textDim }]}>{tr('yourAnswer')}</Text>
-                <Text style={styles.diffLine}>
-                  {result.diff
-                    .filter((p) => p.kind !== 'missing')
-                    .map((p, i) => (
-                      <Text key={i} style={p.kind === 'extra' ? { color: t.danger, textDecorationLine: 'line-through' } : { color: t.text }}>
-                        {p.text}
-                      </Text>
-                    ))}
-                </Text>
-                <Text style={[styles.diffLabel, { color: t.textDim }]}>{tr('rightAnswer')}</Text>
-                <Text style={styles.diffLine}>
-                  {result.diff
-                    .filter((p) => p.kind !== 'extra')
-                    .map((p, i) => (
-                      <Text key={i} style={p.kind === 'missing' ? { color: t.primary, fontWeight: '700', textDecorationLine: 'underline' } : { color: t.text }}>
-                        {p.text}
-                      </Text>
-                    ))}
-                </Text>
+                {divider}
+                {dir === 'ko_ru' ? meaning : korean()}
+                {example}
               </>
             ) : null}
           </Card>
-        )}
-      </>
-    );
-    footer = !result ? <Btn title={tr('check')} disabled={typed.trim() === ''} onPress={submitTyped} /> : <Btn title={tr('next')} disabled={saving} onPress={() => next(retryStep.current)} />;
+          {!feedback ? (
+            <TextInput
+              value={typed}
+              onChangeText={setTyped}
+              onSubmitEditing={() => submit()}
+              placeholder={dir === 'ko_ru' ? tr('answerPlaceholderKoRu') : tr('answerPlaceholderRuKo')}
+              placeholderTextColor={t.textDim + '99'}
+              accessibilityLabel={title}
+              autoFocus
+              autoCorrect={false}
+              autoCapitalize="none"
+              returnKeyType="done"
+              submitBehavior="submit"
+              style={[styles.typeInput, { color: t.text, backgroundColor: t.surface, borderColor: t.border }]}
+            />
+          ) : (
+            <Outcome feedback={feedback} interval={interval} />
+          )}
+        </>
+      );
+      footer = !feedback ? (
+        <Row style={styles.buttons}>
+          <Btn style={styles.flex} kind="soft" title={tr('dontKnow')} disabled={busy} onPress={() => submit(true)} />
+          <Btn style={styles.flex} title={tr('check')} disabled={busy || typed.trim() === ''} onPress={() => submit()} />
+        </Row>
+      ) : (
+        <>
+          {feedback.pendingWrong ? <Btn kind="soft" icon="check" title={tr('acceptMine')} disabled={busy} onPress={acceptMine} /> : null}
+          <Btn title={tr('next')} disabled={busy} onPress={goNext} />
+        </>
+      );
+    }
   }
 
   return (
     <KeyboardAvoidingView behavior="padding" style={[styles.flex, { backgroundColor: t.bg }]}>
       {header}
       <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-        <Text style={[styles.hint, { color: t.textDim }]}>{hint}</Text>
+        <View style={styles.titleRow}>
+          <Text style={[styles.title, { color: t.text }]} accessibilityRole="header">
+            {title}
+          </Text>
+          {badge ? (
+            <View style={[styles.badge, { backgroundColor: t.infoSoft }]}>
+              <Text style={[styles.badgeText, { color: t.info }]}>{badge}</Text>
+            </View>
+          ) : null}
+        </View>
         {content}
       </ScrollView>
       <View style={[styles.footer, { paddingBottom: insets.bottom + space.md }]}>{footer}</View>
@@ -403,25 +430,53 @@ export default function Study() {
   );
 }
 
-function RatingBtn({ label, hint, tone, disabled, onPress }: { label: string; hint: string; tone: Tone; disabled: boolean; onPress: () => void }) {
+function Outcome({ feedback: f, interval }: { feedback: Feedback; interval: (ms: number) => string }) {
   const t = useTheme();
-  const bg = { danger: t.dangerSoft, warn: t.warnSoft, primary: t.primarySoft, info: t.infoSoft }[tone];
-  const fg = t[tone];
+  const tr = useT();
+  const ok = f.correct;
+  const heading = ok ? (f.typo ? tr('correctTypo') : tr('correct')) : f.dontKnow ? tr('dontKnowShown') : tr('wrong');
   return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={`${label}, ${hint}`}
-      android_ripple={{ color: '#00000022' }}
-      style={[styles.rating, { backgroundColor: bg }]}>
-      <Text style={[styles.ratingLabel, { color: fg }]} numberOfLines={1} adjustsFontSizeToFit>
-        {label}
-      </Text>
-      <Text style={[styles.ratingHint, { color: fg }]} numberOfLines={1} adjustsFontSizeToFit>
-        {hint}
-      </Text>
-    </Pressable>
+    <Card style={{ backgroundColor: ok ? t.primarySoft : t.dangerSoft, borderColor: 'transparent' }}>
+      <Row style={styles.between}>
+        <Text style={[styles.verdict, { color: ok ? t.primary : t.danger }]} accessibilityLiveRegion="polite">
+          {heading}
+        </Text>
+        {f.graduated ? (
+          <View style={[styles.badge, { backgroundColor: t.primary }]}>
+            <Text style={[styles.badgeText, { color: t.onPrimary }]}>{tr('learnedBadge')}</Text>
+          </View>
+        ) : null}
+      </Row>
+      {f.diff && !ok ? (
+        <>
+          <Text style={[styles.diffLabel, { color: t.textDim }]}>{tr('yourAnswer')}</Text>
+          <Text style={styles.diffLine}>
+            {f.diff
+              .filter((p) => p.kind !== 'missing')
+              .map((p, i) => (
+                <Text key={i} style={p.kind === 'extra' ? { color: t.danger, textDecorationLine: 'line-through' } : { color: t.text }}>
+                  {p.text}
+                </Text>
+              ))}
+          </Text>
+          <Text style={[styles.diffLabel, { color: t.textDim }]}>{tr('rightAnswer')}</Text>
+          <Text style={styles.diffLine}>
+            {f.diff
+              .filter((p) => p.kind !== 'extra')
+              .map((p, i) => (
+                <Text key={i} style={p.kind === 'missing' ? { color: t.primary, fontWeight: '700', textDecorationLine: 'underline' } : { color: t.text }}>
+                  {p.text}
+                </Text>
+              ))}
+          </Text>
+        </>
+      ) : null}
+      {!f.diff && f.given && !ok ? <Text style={[styles.given, { color: t.danger }]}>{`${tr('yourAnswer')}: ${f.given}`}</Text> : null}
+      {f.typo && f.given ? <Body dim>{`${tr('yourAnswer')}: ${f.given}`}</Body> : null}
+      {f.nextDueMs !== undefined && ok ? <Body dim>{tr('nextReview', { t: interval(f.nextDueMs) })}</Body> : null}
+      {f.after === 'parked' ? <Body dim>{tr('parked')}</Body> : null}
+      {!ok && !f.pendingWrong && f.after !== 'parked' && f.after !== 'done' ? <Body dim>{tr('willRepeat')}</Body> : null}
+    </Card>
   );
 }
 
@@ -437,13 +492,17 @@ function Summary({ label, value }: { label: string; value: string }) {
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
+  center: { textAlign: 'center' },
   header: { paddingHorizontal: space.sm, paddingRight: space.lg, gap: space.sm },
-  body: { flex: 1, justifyContent: 'center', paddingHorizontal: space.lg },
+  body: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: space.lg, gap: space.md },
   scroll: { flexGrow: 1, justifyContent: 'center', padding: space.lg, gap: space.md },
-  hint: { fontSize: 15, textAlign: 'center', lineHeight: 21 },
-  card: { alignItems: 'center', paddingVertical: space.xxl, gap: space.lg, borderRadius: radius.lg },
+  titleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: space.sm, flexWrap: 'wrap' },
+  title: { fontSize: 18, fontWeight: '700', textAlign: 'center' },
+  card: { alignItems: 'center', paddingVertical: space.xl, gap: space.md, borderRadius: radius.lg },
   centered: { alignItems: 'center', gap: 4 },
+  wrapRow: { flexWrap: 'wrap', justifyContent: 'center' },
   korean: { fontSize: 40, fontWeight: '700', textAlign: 'center', flexShrink: 1 },
+  koreanSmall: { fontSize: 28, fontWeight: '700', textAlign: 'center', flexShrink: 1 },
   reading: { fontSize: 15 },
   meaning: { fontSize: 24, fontWeight: '600', textAlign: 'center' },
   example: { fontSize: 18, textAlign: 'center' },
@@ -452,17 +511,18 @@ const styles = StyleSheet.create({
   badgeText: { fontSize: 12, fontWeight: '700' },
   option: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space.sm, minHeight: 56, paddingHorizontal: space.lg, paddingVertical: space.md, borderRadius: radius.md, borderWidth: 1.5, overflow: 'hidden' },
   optionText: { fontSize: 18, fontWeight: '500', flex: 1 },
-  typeInput: { fontSize: 26, textAlign: 'center', borderWidth: 1, borderRadius: radius.md, paddingVertical: space.lg, paddingHorizontal: space.md },
-  verdict: { fontSize: 20, fontWeight: '700' },
+  optionKorean: { fontSize: 24, fontWeight: '600', flex: 1 },
+  typeInput: { fontSize: 24, textAlign: 'center', borderWidth: 1, borderRadius: radius.md, paddingVertical: space.lg, paddingHorizontal: space.md },
+  between: { justifyContent: 'space-between' },
+  verdict: { fontSize: 20, fontWeight: '700', flexShrink: 1 },
+  given: { fontSize: 16 },
   diffLabel: { fontSize: 12, fontWeight: '600', marginTop: 4 },
   diffLine: { fontSize: 26 },
   footer: { paddingHorizontal: space.lg, paddingTop: space.sm, gap: space.sm, minHeight: 60 },
-  ratings: { gap: space.sm, alignItems: 'stretch' },
-  rating: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: space.sm, paddingHorizontal: 6, borderRadius: radius.md, overflow: 'hidden', minHeight: 60 },
-  ratingLabel: { fontSize: 16, fontWeight: '700' },
-  ratingHint: { fontSize: 12, fontWeight: '500' },
-  summary: { gap: space.md, alignItems: 'stretch' },
+  buttons: { gap: space.sm },
+  summary: { gap: space.md },
+  summaryRow: { gap: space.md, alignItems: 'stretch' },
   summaryTile: { flex: 1, alignItems: 'center', padding: space.md },
   summaryValue: { fontSize: 22, fontWeight: '700' },
-  summaryLabel: { fontSize: 12, fontWeight: '600' },
+  summaryLabel: { fontSize: 12, fontWeight: '600', textAlign: 'center' },
 });
