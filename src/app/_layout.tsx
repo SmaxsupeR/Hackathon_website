@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 import { Text, useColorScheme, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { getDb } from '../db';
-import { loadPreferences } from '../db/repo';
+import { ensureFsrsConfig, loadPreferences } from '../db/repo';
 import { settingsFromPrefs, useApp } from '../state/store';
 import { useT } from '../ui/i18n';
 import { useTheme } from '../ui/theme';
@@ -21,7 +21,10 @@ export default function RootLayout() {
 
   useEffect(() => {
     getDb()
-      .then(loadPreferences)
+      .then(async (db) => {
+        await ensureFsrsConfig(db);
+        return loadPreferences(db);
+      })
       .then((prefs) => {
         setSettings(settingsFromPrefs(prefs));
         setState('ready');
@@ -53,6 +56,7 @@ export default function RootLayout() {
         }}>
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen name="settings" options={{ title: tr('settings') }} />
+        <Stack.Screen name="free" options={{ title: tr('freeTitle') }} />
         <Stack.Screen name="study" options={{ headerShown: false, gestureEnabled: false }} />
       </Stack>
     </SafeAreaProvider>

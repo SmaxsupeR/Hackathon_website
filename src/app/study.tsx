@@ -2,11 +2,13 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Alert, BackHandler, KeyboardAvoidingView, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { checkAnswer, checkMeaning, type DiffPart } from '../core/answer';
-import { answer, cardKey, completeIntro, createSession, currentTask, progress, type Card as LearnCard, type Direction, type Effect, type Session, type Task } from '../core/learning';
-import { pickOptions, sameSyllableCount } from '../core/options';
+import type { DiffPart } from '../core/answer';
+import type { Outcome as AttemptOutcome } from '../core/attempt';
+import { buildChoiceOptions, checkChoice, checkKeyboard, checkSelfGrade } from '../core/exercises';
+import { answer, cardKey, completeIntro, createFreeSession, createSession, currentTask, progress, type Card as LearnCard, type Direction, type Effect, type RecallMethod, type Session, type Task } from '../core/learning';
+import type { SelfGrade } from '../core/model';
 import { getDb } from '../db';
-import { applyEffects, finishSession, getDistractorPool, getEntries, planSession, startSession, type Entry } from '../db/repo';
+import { applyEvent, finishSession, getDistractorPool, getEntries, planFreePractice, planSession, startSession, type Entry, type FreeSource } from '../db/repo';
 import { speakKorean } from '../services/speech';
 import { directionList, useApp } from '../state/store';
 import { Bar, Body, Btn, Card, Empty, Icon, IconBtn, Row } from '../ui/components';
@@ -28,13 +30,37 @@ interface Feedback {
   graduated?: boolean;
   /** A wrong translation that the learner may still claim as right. Not saved yet. */
   pendingWrong?: boolean;
+  /** Answered with the learner's own grade (no right/wrong verdict to show). */
+  selfGraded?: boolean;
 }
 
 const meaningText = (e: Entry) => e.meanings.join('; ');
 
+/** Free-practice parameters passed in the route. */
+type StudyParams = {
+  dicts?: string;
+  /** 'free' for free practice; planned study otherwise. */
+  kind?: string;
+  /** Free practice: 'dicts' | 'entries' | 'hard'. */
+  source?: string;
+  ids?: string;
+  /** Free practice: 'both' | 'ko_ru' | 'ru_ko'. */
+  dirs?: string;
+  /** Free practice: 'choice' | 'keyboard' | 'self_grade'. */
+  method?: string;
+  limit?: string;
+  fails?: string;
+  /** Free practice: '1' to count due reviews in FSRS. */
+  count?: string;
+};
+
+const SELF_GRADES_SIMPLE: SelfGrade[] = ['again', 'good'];
+const SELF_GRADES_DETAILED: SelfGrade[] = ['again', 'hard', 'good', 'easy'];
+
 export default function Study() {
-  const params = useLocalSearchParams<{ dicts?: string }>();
+  const params = useLocalSearchParams<StudyParams>();
   const dicts = (params.dicts ?? '').split(',').filter(Boolean);
+  const free = params.kind === 'free';
 
   const t = useTheme();
   const tr = useT();
@@ -47,6 +73,8 @@ export default function Study() {
   const [session, setSession] = useState<Session | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [typed, setTyped] = useState('');
+  /** Self-assessed card: the answer is shown, waiting for the learner's grade. */
+  const [revealed, setRevealed] = useState(false);
   const [busy, setBusy] = useState(false);
   const entries = useRef(new Map<string, Entry>());
   const options = useRef(new Map<string, string[]>());
@@ -60,20 +88,35 @@ export default function Study() {
     (async () => {
       const db = await getDb();
       const now = Date.now();
-      const directions = directionList(settings.directions);
-      const plan = await planSession(db, { dictionaryIds: dicts, directions, now, newPerDay: settings.newPerDay, maxReviews: settings.maxReviews });
-      const ids = [...new Set([...plan.reviews.map((r) => r.entryId), ...plan.learning.map((l) => l.entryId), ...plan.fresh])];
-      entries.current = await getEntries(db, ids);
-      const pool = [...entries.current.values()].map((e) => ({ korean: e.korean, meaning: e.meanings[0] ?? '' }));
-      pool.push(...(await getDistractorPool(db, 80)));
-      for (const e of entries.current.values()) {
-        const koRu = pickOptions({ correct: e.meanings[0] ?? '', alsoRight: e.meanings, pool: pool.map((p) => p.meaning), count: 4 });
-        if (koRu) options.current.set(cardKey(e.id, 'ko_ru'), koRu);
-        const ruKo = pickOptions({ correct: e.korean, alsoRight: [e.korean], pool: pool.map((p) => p.korean), count: 4, similar: sameSyllableCount(e.korean) });
-        if (ruKo) options.current.set(cardKey(e.id, 'ru_ko'), ruKo);
+      const loadOptions = async (ids: string[]) => {
+        entries.current = await getEntries(db, ids);
+        const pool = [...entries.current.values()].map((e) => ({ korean: e.korean, meaning: e.meanings[0] ?? '' }));
+        pool.push(...(await getDistractorPool(db, 80)));
+        for (const e of entries.current.values()) {
+          for (const d of ['ko_ru', 'ru_ko'] as const) {
+            const o = buildChoiceOptions(e, d, pool);
+            if (o) options.current.set(cardKey(e.id, d), o);
+          }
+        }
+      };
+      const hasChoice = (id: string, d: Direction) => options.current.has(cardKey(id, d));
+      let s: Session;
+      if (free) {
+        const directions: Direction[] = params.dirs === 'ko_ru' || params.dirs === 'ru_ko' ? [params.dirs] : ['ko_ru', 'ru_ko'];
+        const ids = (params.ids ?? '').split(',').filter(Boolean);
+        const source: FreeSource = params.source === 'entries' ? { kind: 'entries', ids } : params.source === 'hard' ? { kind: 'hard', dictionaryIds: dicts } : { kind: 'dictionaries', ids: dicts };
+        const seeds = await planFreePractice(db, { source, directions, now, limit: Math.max(1, Number(params.limit) || 20) });
+        await loadOptions([...new Set(seeds.map((x) => x.entryId))]);
+        if (seeds.length > 0) sessionId.current = await startSession(db, params.source === 'hard' ? 'hard_words' : 'practice', dicts, now, 'free');
+        const method = params.method === 'choice' || params.method === 'self_grade' ? params.method : 'keyboard';
+        s = createFreeSession({ cards: seeds, method, countAsReview: params.count === '1', maxFails: Number(params.fails) || settings.practiceAttempts, hasChoice, sessionId: sessionId.current });
+      } else {
+        const directions = directionList(settings.directions);
+        const plan = await planSession(db, { dictionaryIds: dicts, directions, now, newPerDay: settings.newPerDay, maxReviews: settings.maxReviews });
+        await loadOptions([...new Set([...plan.reviews.map((r) => r.entryId), ...plan.learning.map((l) => l.entryId), ...plan.fresh])]);
+        if (plan.reviews.length + plan.learning.length + plan.fresh.length > 0) sessionId.current = await startSession(db, 'learn', dicts, now);
+        s = createSession({ ...plan, directions, hasChoice, method: settings.answerMethod, sessionId: sessionId.current });
       }
-      const s = createSession({ ...plan, directions, hasChoice: (id, d) => options.current.has(cardKey(id, d)) });
-      if (s.queue.length > 0) sessionId.current = await startSession(db, 'learn', dicts, now);
       shownAt.current = Date.now();
       setSession(s);
     })().catch((e: unknown) => Alert.alert(tr('error'), e instanceof Error ? e.message : String(e)));
@@ -97,30 +140,25 @@ export default function Study() {
     if (task?.kind === 'intro' && entry && settings.autoSpeak) speak(entry.korean, true);
   }, [task, entry, settings.autoSpeak, speak]);
 
-  const save = async (effects: Effect[], extra: { given?: string; selfAccepted?: boolean } = {}) => {
-    const now = Date.now();
-    return applyEffects(await getDb(), effects, {
-      now,
-      retention: settings.retention,
-      sessionId: sessionId.current,
-      durationMs: Math.min(now - shownAt.current, 120000),
-      answerGiven: extra.given ?? null,
-      selfAccepted: extra.selfAccepted,
-    });
+  /** Saves one event. `now` must be the same moment as the attempt's `at`. */
+  const save = async (effects: Effect[], now = Date.now()) => {
+    const r = await applyEvent(await getDb(), effects, { now, retention: settings.retention, sessionId: sessionId.current });
+    return r.card;
   };
 
   const fail = (e: unknown) => Alert.alert(tr('error'), e instanceof Error ? e.message : String(e));
 
   /** Runs one step of the state machine and saves it. The screen keeps showing this question until "Next". */
-  const commit = async (correct: boolean, view: Feedback, extra: { given?: string; selfAccepted?: boolean } = {}) => {
+  const commit = async (outcome: Omit<AttemptOutcome, 'at' | 'durationMs'>, view: Feedback) => {
     if (!session) return;
     setBusy(true);
     try {
-      const step = answer(session, correct);
-      const scheduled = await save(step.effects, extra);
+      const at = Date.now();
+      const step = answer(pending.current?.session ?? session, { ...outcome, at, durationMs: Math.min(at - shownAt.current, 120000) });
+      const scheduled = await save(step.effects, at);
       const graduated = step.effects.some((e) => e.type === 'graduate');
       pending.current = null;
-      setFeedback({ ...view, correct, after: step.card.stage, graduated, nextDueMs: scheduled ? scheduled.due - Date.now() : undefined, pendingWrong: false });
+      setFeedback({ ...view, correct: outcome.correct, after: step.card.stage, graduated, nextDueMs: scheduled ? scheduled.due - at : undefined, pendingWrong: false });
       setSession(step.session);
     } catch (e) {
       fail(e);
@@ -138,10 +176,11 @@ export default function Study() {
   const goNext = async () => {
     // A wrong translation not claimed as right is saved now.
     if (feedback?.pendingWrong && pending.current) {
-      await commit(false, { ...feedback, pendingWrong: false }, { given: pending.current.given });
+      await commit({ correct: false, method: 'keyboard', given: pending.current.given }, { ...feedback, pendingWrong: false });
     }
     setFeedback(null);
     setTyped('');
+    setRevealed(false);
     shownAt.current = Date.now();
   };
 
@@ -150,7 +189,7 @@ export default function Study() {
     setBusy(true);
     try {
       const step = completeIntro(session);
-      await save(step.effects);
+      await save(step.effects, Date.now());
       setSession(step.session);
       shownAt.current = Date.now();
     } catch (e) {
@@ -163,8 +202,8 @@ export default function Study() {
   const choose = (option: string) => {
     if (!shown || !card || feedback || busy) return;
     const e = shown.entry;
-    const right = card.direction === 'ko_ru' ? e.meanings.map((m) => m.trim().toLowerCase()).includes(option.trim().toLowerCase()) : option === e.korean;
-    commit(right, { correct: right, picked: option });
+    const right = checkChoice(e, card.direction, option).correct;
+    commit({ correct: right, method: 'choice', given: option }, { correct: right, picked: option });
     if (settings.autoSpeak) speak(e.korean, true);
   };
 
@@ -174,14 +213,9 @@ export default function Study() {
     const given = dontKnow ? '' : typed;
     if (!dontKnow && given.trim() === '') return;
     if (settings.autoSpeak) speak(e.korean, true);
-    if (card.direction === 'ru_ko') {
-      const r = checkAnswer(given, [e.korean], { ignoreSpaces: !settings.strictSpacing, ignorePunctuation: true });
-      commit(r.correct, { correct: r.correct, dontKnow, given, diff: dontKnow ? undefined : r.diff }, { given });
-      return;
-    }
-    const r = checkMeaning(given, e.meanings);
-    if (r.correct || dontKnow) {
-      commit(r.correct, { correct: r.correct, typo: r.typo, dontKnow, given }, { given });
+    const r = checkKeyboard(e, card.direction, given, { strictSpacing: settings.strictSpacing });
+    if (r.correct || dontKnow || !r.canSelfAccept) {
+      commit({ correct: r.correct, method: 'keyboard', typoCorrected: r.typo, given }, { correct: r.correct, typo: r.typo, dontKnow, given, diff: dontKnow ? undefined : (r.diff ?? undefined) });
       return;
     }
     // A translation can be right in words the dictionary does not list: let the learner say so before saving.
@@ -192,7 +226,20 @@ export default function Study() {
   const acceptMine = () => {
     if (!feedback?.pendingWrong || !pending.current) return;
     const given = pending.current.given;
-    commit(true, { correct: true, given }, { given, selfAccepted: true });
+    commit({ correct: true, method: 'keyboard', given, selfAccepted: true }, { correct: true, given });
+  };
+
+  /** Self-assessed card: show the answer, then the learner grades how well they knew it. */
+  const reveal = () => {
+    if (!card || feedback || busy) return;
+    setRevealed(true);
+    if (settings.autoSpeak && shown) speak(shown.entry.korean, true);
+  };
+
+  const grade = (g: SelfGrade) => {
+    if (!revealed || feedback || busy) return;
+    const ok = checkSelfGrade(g).correct;
+    commit({ correct: ok, method: 'self_grade', selfGrade: g }, { correct: ok, selfGraded: true });
   };
 
   const close = useCallback(async () => {
@@ -200,8 +247,9 @@ export default function Study() {
       const db = await getDb();
       if (pending.current && session) {
         // Leaving with an unconfirmed wrong translation counts it as wrong.
-        const step = answer(pending.current.session, false);
-        await applyEffects(db, step.effects, { now: Date.now(), retention: settings.retention, sessionId: sessionId.current, answerGiven: pending.current.given });
+        const at = Date.now();
+        const step = answer(pending.current.session, { correct: false, method: 'keyboard', given: pending.current.given, at });
+        await applyEvent(db, step.effects, { now: at, retention: settings.retention, sessionId: sessionId.current });
         pending.current = null;
       }
       if (sessionId.current) await finishSession(db, sessionId.current);
@@ -253,11 +301,17 @@ export default function Study() {
           {empty ? <Empty icon="calendar-check" title={tr('nothingToStudy')} text={tr('nothingToStudyText')} /> : <Empty icon="party-popper" title={tr('sessionDone')} />}
           {!empty ? (
             <View style={styles.summary}>
-              <Row style={styles.summaryRow}>
-                <Summary label={tr('sumIntroduced')} value={String(st.introduced)} />
-                <Summary label={tr('sumLearned')} value={String(st.learnedWords.length)} />
-                <Summary label={tr('sumReviewed')} value={st.reviewed > 0 ? `${st.reviewCorrect}/${st.reviewed}` : '0'} />
-              </Row>
+              {session.kind === 'free' ? (
+                <Body dim style={styles.center}>
+                  {st.reviewed > 0 ? tr('freeCountedNote', { n: st.reviewed }) : tr('freeNoScheduleNote')}
+                </Body>
+              ) : (
+                <Row style={styles.summaryRow}>
+                  <Summary label={tr('sumIntroduced')} value={String(st.introduced)} />
+                  <Summary label={tr('sumLearned')} value={String(st.learnedWords.length)} />
+                  <Summary label={tr('sumReviewed')} value={st.reviewed > 0 ? `${st.reviewCorrect}/${st.reviewed}` : '0'} />
+                </Row>
+              )}
               <Row style={styles.summaryRow}>
                 <Summary label={tr('sumAccuracy')} value={st.answers > 0 ? `${Math.round((st.correct / st.answers) * 100)}%` : '—'} />
                 <Summary label={tr('sessionTime')} value={tr('minutes', { n: minutes })} />
@@ -302,7 +356,7 @@ export default function Study() {
 
   // ---------- Intro ----------
   if (view.task.kind === 'intro') {
-    title = view.task.repeat ? tr('stepIntroAgain') : tr('stepIntro');
+    title = view.task.repeat && e.introduced_at !== null ? tr('stepIntroAgain') : tr('stepIntro');
     content = (
       <>
         <Body dim style={styles.center}>
@@ -325,6 +379,8 @@ export default function Study() {
     const purpose = view.task.kind === 'recall' ? view.task.purpose : null;
     if (purpose === 'review') badge = tr('stepReview');
     if (purpose === 'relearn') badge = tr('stepRelearn');
+    if (session.kind === 'free') badge = tr('freeBadge');
+    const recallMethod: RecallMethod = c.method && c.method !== 'choice' ? c.method : session.method;
 
     // ---------- Recognition ----------
     if (view.task.kind === 'recognize') {
@@ -360,6 +416,36 @@ export default function Study() {
         </>
       );
       footer = feedback ? <Btn title={tr('next')} disabled={busy} onPress={goNext} /> : null;
+    } else if (recallMethod === 'self_grade') {
+      // ---------- Self-assessed card: recall, show the answer, grade yourself ----------
+      title = dir === 'ko_ru' ? tr('stepSelfKoRu') : tr('stepSelfRuKo');
+      const grades = settings.detailedGrading ? SELF_GRADES_DETAILED : SELF_GRADES_SIMPLE;
+      content = (
+        <>
+          <Card style={styles.card}>
+            {dir === 'ko_ru' ? korean() : meaning}
+            {revealed || feedback ? (
+              <>
+                {divider}
+                {dir === 'ko_ru' ? meaning : korean()}
+                {example}
+              </>
+            ) : null}
+          </Card>
+          {feedback ? <Outcome feedback={feedback} interval={interval} /> : revealed ? <Body dim style={styles.center}>{tr('selfGradeHint')}</Body> : null}
+        </>
+      );
+      footer = feedback ? (
+        <Btn title={tr('next')} disabled={busy} onPress={goNext} />
+      ) : !revealed ? (
+        <Btn title={tr('showAnswer')} onPress={reveal} />
+      ) : (
+        <Row style={styles.buttons}>
+          {grades.map((g) => (
+            <GradeBtn key={g} grade={g} disabled={busy} onPress={() => grade(g)} />
+          ))}
+        </Row>
+      );
     } else {
       // ---------- Recall (training, review or relearning) ----------
       title = dir === 'ko_ru' ? tr('stepRecallKoRu') : tr('stepRecallRuKo');
@@ -434,7 +520,7 @@ function Outcome({ feedback: f, interval }: { feedback: Feedback; interval: (ms:
   const t = useTheme();
   const tr = useT();
   const ok = f.correct;
-  const heading = ok ? (f.typo ? tr('correctTypo') : tr('correct')) : f.dontKnow ? tr('dontKnowShown') : tr('wrong');
+  const heading = f.selfGraded ? (ok ? tr('selfGradedOk') : tr('dontKnowShown')) : ok ? (f.typo ? tr('correctTypo') : tr('correct')) : f.dontKnow ? tr('dontKnowShown') : tr('wrong');
   return (
     <Card style={{ backgroundColor: ok ? t.primarySoft : t.dangerSoft, borderColor: 'transparent' }}>
       <Row style={styles.between}>
@@ -480,6 +566,27 @@ function Outcome({ feedback: f, interval }: { feedback: Feedback; interval: (ms:
   );
 }
 
+const GRADE_STYLE: Record<SelfGrade, { key: 'again' | 'hard' | 'remember' | 'easy'; tone: 'danger' | 'warn' | 'primary' | 'info' }> = {
+  again: { key: 'again', tone: 'danger' },
+  hard: { key: 'hard', tone: 'warn' },
+  good: { key: 'remember', tone: 'primary' },
+  easy: { key: 'easy', tone: 'info' },
+};
+
+function GradeBtn({ grade, disabled, onPress }: { grade: SelfGrade; disabled: boolean; onPress: () => void }) {
+  const t = useTheme();
+  const tr = useT();
+  const { key, tone } = GRADE_STYLE[grade];
+  const bg = { danger: t.dangerSoft, warn: t.warnSoft, primary: t.primarySoft, info: t.infoSoft }[tone];
+  return (
+    <Pressable onPress={onPress} disabled={disabled} accessibilityRole="button" accessibilityLabel={tr(key)} android_ripple={{ color: '#00000022' }} style={[styles.grade, { backgroundColor: bg }]}>
+      <Text style={[styles.gradeText, { color: t[tone] }]} numberOfLines={1} adjustsFontSizeToFit>
+        {tr(key)}
+      </Text>
+    </Pressable>
+  );
+}
+
 function Summary({ label, value }: { label: string; value: string }) {
   const t = useTheme();
   return (
@@ -520,6 +627,8 @@ const styles = StyleSheet.create({
   diffLine: { fontSize: 26 },
   footer: { paddingHorizontal: space.lg, paddingTop: space.sm, gap: space.sm, minHeight: 60 },
   buttons: { gap: space.sm },
+  grade: { flex: 1, minHeight: 56, borderRadius: radius.md, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6, overflow: 'hidden' },
+  gradeText: { fontSize: 16, fontWeight: '700' },
   summary: { gap: space.md },
   summaryRow: { gap: space.md, alignItems: 'stretch' },
   summaryTile: { flex: 1, alignItems: 'center', padding: space.md },

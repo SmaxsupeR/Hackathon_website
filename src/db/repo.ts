@@ -2,7 +2,9 @@
 import { splitMeanings, type ImportRow } from '../core/importer';
 import { normalizeHangul, romanize } from '../core/hangul';
 import { newId } from '../core/id';
-import { type AttemptMode, type Direction, type Effect, type LearningSeed, type ReviewSeed } from '../core/learning';
+import { DIRECTIONS, type AttemptMode, type Direction, type Effect, type FreeSeed, type LearningSeed, type ReviewSeed } from '../core/learning';
+import { FSRS_CONFIG, FSRS_CONFIG_PREF_KEY } from '../core/fsrsConfig';
+import type { SessionKind } from '../core/model';
 import { newCard, reviewCard, STABLE_DAYS, State, type CardState, type Mastery, type Skill } from '../core/scheduler';
 import type { Grade } from 'ts-fsrs';
 import { TABLES, type Db } from './schema';
@@ -398,12 +400,15 @@ export async function planSession(db: Db, opts: PlanOptions): Promise<PlanIds> {
   if (dirs.length === 0) return { reviews: [], learning: [], fresh: [] };
   const dirIn = placeholders(dirs.length);
 
-  // Due reviews, earliest first. Only one direction per word per session, so one
-  // direction cannot give away the answer to the other (the sibling waits a day).
+  // Due reviews, earliest first. Only one direction per word per day, so one direction
+  // cannot give away the answer to the other: once a word was reviewed today in one
+  // direction, its other direction waits until tomorrow.
   const due = await db.getAllAsync<{ entry_id: string; skill: Direction }>(
     `SELECT c.entry_id, c.skill FROM review_cards c JOIN entries e ON e.id = c.entry_id JOIN dictionaries d ON d.id = e.dictionary_id
-     WHERE ${s.sql} AND c.skill IN (${dirIn}) AND c.due <= ? ORDER BY c.due, c.entry_id`,
-    [...s.params, ...dirs, opts.now],
+     WHERE ${s.sql} AND c.skill IN (${dirIn}) AND c.due <= ?
+       AND NOT EXISTS (SELECT 1 FROM review_history h WHERE h.entry_id = c.entry_id AND h.skill != c.skill AND h.reviewed_at >= ?)
+     ORDER BY c.due, c.entry_id`,
+    [...s.params, ...dirs, opts.now, startOfDay(opts.now)],
   );
   const reviews: ReviewSeed[] = [];
   const reviewed = new Set<string>();
@@ -488,10 +493,11 @@ export async function getDistractorPool(db: Db, limit: number): Promise<Distract
   );
 }
 
-export async function startSession(db: Db, mode: string, dictionaryIds: string[], now = Date.now()): Promise<string> {
+export async function startSession(db: Db, mode: string, dictionaryIds: string[], now = Date.now(), kind: SessionKind = 'scheduled'): Promise<string> {
   const id = newId();
-  await db.runAsync('INSERT INTO practice_sessions (id, mode, dictionary_ids, started_at) VALUES (?, ?, ?, ?)', [id, mode, JSON.stringify(dictionaryIds), now]);
-  for (const d of dictionaryIds) await updateDictionary(db, d, { last_used_at: now }, now);
+  await db.runAsync('INSERT INTO practice_sessions (id, mode, dictionary_ids, started_at, kind) VALUES (?, ?, ?, ?, ?)', [id, mode, JSON.stringify(dictionaryIds), now, kind]);
+  // Free practice does not move dictionaries up the "recent" list of planned study.
+  if (kind === 'scheduled') for (const d of dictionaryIds) await updateDictionary(db, d, { last_used_at: now }, now);
   return id;
 }
 
@@ -521,6 +527,9 @@ interface CardColumns {
   last_review: number | null;
 }
 
+const CARD_SELECT =
+  'SELECT id AS card_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps, reps, lapses, state, last_review FROM review_cards WHERE entry_id = ? AND skill = ?';
+
 function rowToCard(r: CardColumns): CardState {
   return {
     due: r.due,
@@ -537,21 +546,27 @@ function rowToCard(r: CardColumns): CardState {
 }
 
 export async function getCard(db: Db, entryId: string, skill: Skill): Promise<CardState | null> {
-  const row = await db.getFirstAsync<CardColumns>(
-    'SELECT id AS card_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps, reps, lapses, state, last_review FROM review_cards WHERE entry_id = ? AND skill = ?',
-    [entryId, skill],
-  );
+  const row = await db.getFirstAsync<CardColumns>(CARD_SELECT, [entryId, skill]);
   return row ? rowToCard(row) : null;
 }
 
-/** Applies one FSRS rating and logs it. Must run inside a transaction. */
-async function writeReview(db: Db, entryId: string, skill: Skill, rating: number, now: number, retention: number, sessionId: string | null, durationMs: number): Promise<CardState> {
-  const row = await db.getFirstAsync<CardColumns>(
-    'SELECT id AS card_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps, reps, lapses, state, last_review FROM review_cards WHERE entry_id = ? AND skill = ?',
-    [entryId, skill],
-  );
-  const before = row ? rowToCard(row) : newCard(now);
-  const { card, log } = reviewCard(before, rating as Grade, now, retention);
+interface ReviewWrite {
+  entryId: string;
+  skill: Skill;
+  rating: number;
+  now: number;
+  retention: number;
+  sessionId: string | null;
+  durationMs: number;
+  /** Idempotency key; the same event is never applied twice (unique index on review_history.event_id). */
+  eventId: string;
+}
+
+/** Applies one FSRS rating and logs it. Must run inside a transaction, after the checks in `checkRating`. */
+async function writeReview(db: Db, w: ReviewWrite): Promise<CardState> {
+  const row = await db.getFirstAsync<CardColumns>(CARD_SELECT, [w.entryId, w.skill]);
+  const before = row ? rowToCard(row) : newCard(w.now);
+  const { card, log } = reviewCard(before, w.rating as Grade, w.now, w.retention);
   const values = [card.due, card.stability, card.difficulty, card.elapsed_days, card.scheduled_days, card.learning_steps, card.reps, card.lapses, card.state, card.last_review];
   if (row) {
     await db.runAsync(
@@ -561,18 +576,34 @@ async function writeReview(db: Db, entryId: string, skill: Skill, rating: number
   } else {
     await db.runAsync(
       'INSERT INTO review_cards (due, stability, difficulty, elapsed_days, scheduled_days, learning_steps, reps, lapses, state, last_review, id, entry_id, skill) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [...values, newId(), entryId, skill],
+      [...values, newId(), w.entryId, w.skill],
     );
   }
   await db.runAsync(
-    `INSERT INTO review_history (id, entry_id, skill, session_id, rating, state, due, stability, difficulty, elapsed_days, scheduled_days, reviewed_at, duration_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [newId(), entryId, skill, sessionId, log.rating, log.state, log.due, log.stability, log.difficulty, log.elapsed_days, log.scheduled_days, log.reviewed_at, durationMs],
+    `INSERT INTO review_history (id, entry_id, skill, session_id, rating, state, due, stability, difficulty, elapsed_days, scheduled_days, reviewed_at, duration_ms, event_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [newId(), w.entryId, w.skill, w.sessionId, log.rating, log.state, log.due, log.stability, log.difficulty, log.elapsed_days, log.scheduled_days, log.reviewed_at, w.durationMs, w.eventId],
   );
   return card;
 }
 
+export type RejectReason = 'already_scheduled' | 'not_scheduled' | 'not_due' | 'missing_entry';
+
+/**
+ * Checks, right before writing, that an FSRS change is valid against the stored state:
+ * a card graduates only once, and only a scheduled card that is due can be reviewed.
+ */
+async function checkRating(db: Db, e: Extract<Effect, { type: 'graduate' | 'review' | 'phase' }>, now: number): Promise<RejectReason | null> {
+  const entry = await db.getFirstAsync<{ id: string }>('SELECT id FROM entries WHERE id = ?', [e.entryId]);
+  if (!entry) return 'missing_entry';
+  const card = await db.getFirstAsync<{ due: number }>('SELECT due FROM review_cards WHERE entry_id = ? AND skill = ?', [e.entryId, e.direction]);
+  if (e.type === 'graduate' || e.type === 'phase') return card ? 'already_scheduled' : null;
+  if (!card) return 'not_scheduled';
+  return card.due > now ? 'not_due' : null;
+}
+
 export interface AnswerMeta {
+  /** Time of the event (ms). Must equal AttemptResult.at when a result is attached. */
   now: number;
   retention: number;
   sessionId?: string | null;
@@ -582,56 +613,114 @@ export interface AnswerMeta {
   selfAccepted?: boolean;
 }
 
+export interface ApplyResult {
+  /** The FSRS card after this event, if the event rated one. */
+  card: CardState | null;
+  /** The event had already been saved; nothing changed. */
+  duplicate: boolean;
+  /** Effects refused by the checks; the attempt itself is still logged. */
+  rejected: { type: Effect['type']; reason: RejectReason }[];
+}
+
 /**
- * Saves the effects of one step of the learning state machine in one transaction,
- * so leaving the session at any moment keeps everything answered so far.
- * Returns the FSRS card if this step rated one.
+ * Saves one step of the learning state machine as one event, in one transaction:
+ * the attempt, a training-stage change and at most one FSRS rating.
+ *
+ * - Idempotent: the attempt id is the event id. Saving the same event again changes nothing.
+ * - Validated right before writing: invalid FSRS changes are refused, not applied.
+ * - Atomic: either the whole event is saved or none of it.
  */
-export async function applyEffects(db: Db, effects: Effect[], meta: AnswerMeta): Promise<CardState | null> {
-  let scheduled: CardState | null = null;
-  const sessionId = meta.sessionId ?? null;
-  const duration = Math.max(0, Math.round(meta.durationMs ?? 0));
+export async function applyEvent(db: Db, effects: Effect[], meta: AnswerMeta): Promise<ApplyResult> {
+  const out: ApplyResult = { card: null, duplicate: false, rejected: [] };
+  const attempt = effects.find((e): e is Extract<Effect, { type: 'attempt' }> => e.type === 'attempt');
+  const r = attempt?.result;
+  const eventId = r?.attemptId ?? newId();
+  // meta.now is the event time: validation, FSRS and the attempt record all use it.
+  // Screens pass the same value as the attempt's `at`.
+  const now = meta.now;
+  const sessionId = r?.sessionId ?? meta.sessionId ?? null;
+  const duration = Math.max(0, Math.round(r?.durationMs ?? meta.durationMs ?? 0));
   await db.withTransactionAsync(async () => {
-    const rating = effects.find((e) => e.type === 'graduate' || e.type === 'review');
+    if (attempt && (await db.getFirstAsync('SELECT 1 AS x FROM practice_attempts WHERE id = ?', [eventId]))) {
+      out.duplicate = true;
+      return;
+    }
+    let rating: number | null = null;
     for (const e of effects) {
       switch (e.type) {
         case 'introduce':
-          await db.runAsync('UPDATE entries SET introduced_at = COALESCE(introduced_at, ?) WHERE id = ?', [meta.now, e.entryId]);
+          await db.runAsync('UPDATE entries SET introduced_at = COALESCE(introduced_at, ?) WHERE id = ?', [now, e.entryId]);
           for (const d of e.directions) {
             await db.runAsync(
               `INSERT INTO acquisition (entry_id, direction, phase, errors, updated_at)
                SELECT ?, ?, 'recognition', 0, ? WHERE NOT EXISTS (SELECT 1 FROM review_cards WHERE entry_id = ? AND skill = ?)
                ON CONFLICT(entry_id, direction) DO NOTHING`,
-              [e.entryId, d, meta.now, e.entryId, d],
+              [e.entryId, d, now, e.entryId, d],
             );
           }
           break;
-        case 'phase':
+        case 'phase': {
+          const bad = await checkRating(db, e, now);
+          if (bad && bad !== 'missing_entry') {
+            out.rejected.push({ type: e.type, reason: bad });
+            break;
+          }
           await db.runAsync(
             `INSERT INTO acquisition (entry_id, direction, phase, errors, updated_at) VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(entry_id, direction) DO UPDATE SET phase = excluded.phase, errors = excluded.errors, updated_at = excluded.updated_at`,
-            [e.entryId, e.direction, e.phase, e.errors, meta.now],
+            [e.entryId, e.direction, e.phase, e.errors, now],
           );
-          await db.runAsync('UPDATE entries SET introduced_at = COALESCE(introduced_at, ?) WHERE id = ?', [meta.now, e.entryId]);
+          await db.runAsync('UPDATE entries SET introduced_at = COALESCE(introduced_at, ?) WHERE id = ?', [now, e.entryId]);
           break;
+        }
         case 'graduate':
-          scheduled = await writeReview(db, e.entryId, e.direction, e.grade, meta.now, meta.retention, sessionId, duration);
-          await db.runAsync('DELETE FROM acquisition WHERE entry_id = ? AND direction = ?', [e.entryId, e.direction]);
+        case 'review': {
+          const bad = await checkRating(db, e, now);
+          if (bad) {
+            out.rejected.push({ type: e.type, reason: bad });
+            break;
+          }
+          out.card = await writeReview(db, { entryId: e.entryId, skill: e.direction, rating: e.grade, now, retention: meta.retention, sessionId, durationMs: duration, eventId });
+          rating = e.grade;
+          if (e.type === 'graduate') await db.runAsync('DELETE FROM acquisition WHERE entry_id = ? AND direction = ?', [e.entryId, e.direction]);
           break;
-        case 'review':
-          scheduled = await writeReview(db, e.entryId, e.direction, e.grade, meta.now, meta.retention, sessionId, duration);
-          break;
+        }
         case 'attempt':
-          await db.runAsync(
-            `INSERT INTO practice_attempts (id, session_id, entry_id, skill, mode, is_correct, rating, answer_given, hints_used, duration_ms, created_at, self_accepted)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-            [newId(), sessionId, e.entryId, e.direction, e.mode, e.correct ? 1 : 0, rating ? rating.grade : null, meta.answerGiven ?? null, duration, meta.now, meta.selfAccepted ? 1 : 0],
-          );
           break;
       }
     }
+    if (attempt) {
+      await db.runAsync(
+        `INSERT INTO practice_attempts (id, session_id, entry_id, skill, mode, is_correct, rating, answer_given, hints_used, duration_ms, created_at,
+           self_accepted, method, learning_skill, session_kind, typo_corrected)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          eventId,
+          sessionId,
+          attempt.entryId,
+          attempt.direction,
+          attempt.mode,
+          attempt.correct ? 1 : 0,
+          rating,
+          r?.given ?? meta.answerGiven ?? null,
+          r?.hintsUsed ?? 0,
+          duration,
+          now,
+          r?.selfAccepted || meta.selfAccepted ? 1 : 0,
+          r?.method ?? (attempt.mode === 'recognition' ? 'choice' : 'keyboard'),
+          r?.skill ?? (attempt.mode === 'recognition' ? 'recognition' : 'recall'),
+          r?.sessionKind ?? 'scheduled',
+          r?.typoCorrected ? 1 : 0,
+        ],
+      );
+    }
   });
-  return scheduled;
+  return out;
+}
+
+/** Same as applyEvent, returning only the rated card (kept for existing callers). */
+export async function applyEffects(db: Db, effects: Effect[], meta: AnswerMeta): Promise<CardState | null> {
+  return (await applyEvent(db, effects, meta)).card;
 }
 
 export interface ReviewInput {
@@ -646,20 +735,138 @@ export interface ReviewInput {
   answerGiven?: string | null;
 }
 
-/** Rates a card directly (outside the state machine) and logs the attempt. */
+/**
+ * Rates a card directly, outside the state machine and its checks. For tests and data
+ * tools only; the app saves answers through applyEvent.
+ */
 export async function recordReview(db: Db, input: ReviewInput): Promise<CardState> {
   let result: CardState | null = null;
+  const eventId = newId();
   await db.withTransactionAsync(async () => {
-    result = await writeReview(db, input.entryId, input.skill, input.rating, input.now, input.retention, input.sessionId ?? null, input.durationMs ?? 0);
+    result = await writeReview(db, {
+      entryId: input.entryId,
+      skill: input.skill,
+      rating: input.rating,
+      now: input.now,
+      retention: input.retention,
+      sessionId: input.sessionId ?? null,
+      durationMs: input.durationMs ?? 0,
+      eventId,
+    });
     await db.runAsync('DELETE FROM acquisition WHERE entry_id = ? AND direction = ?', [input.entryId, input.skill]);
     await db.runAsync('UPDATE entries SET introduced_at = COALESCE(introduced_at, ?) WHERE id = ?', [input.now, input.entryId]);
     await db.runAsync(
-      `INSERT INTO practice_attempts (id, session_id, entry_id, skill, mode, is_correct, rating, answer_given, hints_used, duration_ms, created_at, self_accepted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)`,
-      [newId(), input.sessionId ?? null, input.entryId, input.skill, input.mode, input.rating > 1 ? 1 : 0, input.rating, input.answerGiven ?? null, input.durationMs ?? 0, input.now],
+      `INSERT INTO practice_attempts (id, session_id, entry_id, skill, mode, is_correct, rating, answer_given, hints_used, duration_ms, created_at,
+         self_accepted, method, learning_skill, session_kind, typo_corrected)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 'keyboard', 'recall', 'scheduled', 0)`,
+      [eventId, input.sessionId ?? null, input.entryId, input.skill, input.mode, input.rating > 1 ? 1 : 0, input.rating, input.answerGiven ?? null, input.durationMs ?? 0, input.now],
     );
   });
   return result as unknown as CardState;
+}
+
+// ---------- Free practice and difficult words ----------
+
+/** What to practise freely. */
+export type FreeSource =
+  | { kind: 'dictionaries'; ids: string[] }
+  | { kind: 'entries'; ids: string[] }
+  | { kind: 'hard'; dictionaryIds: string[] };
+
+export interface FreePlanOptions {
+  source: FreeSource;
+  directions: Direction[];
+  now: number;
+  /** Maximum number of words. */
+  limit: number;
+}
+
+export interface DifficultWord {
+  id: string;
+  korean: string;
+  meaning: string | null;
+  /** Wrong answers in the last 60 days, any kind of question. */
+  mistakes: number;
+  /** Times a scheduled review was forgotten. */
+  lapses: number;
+  /** Left a planned session after reaching the mistake limit, and is still in training. */
+  parked: boolean;
+  answers: number;
+}
+
+/** Mistakes in training at or above this mean the word was parked at least once. */
+export const PARKED_ERRORS = 3;
+
+/**
+ * Difficult words, from three sources: frequent mistakes, forgotten reviews and words
+ * parked after too many mistakes. Most difficult first.
+ */
+export async function getDifficultWords(db: Db, opts: { dictionaryIds?: string[]; limit: number; now: number }): Promise<DifficultWord[]> {
+  const ids = opts.dictionaryIds ?? [];
+  const s = ids.length ? { sql: `d.id IN (${placeholders(ids.length)})`, params: ids } : { sql: 'd.is_archived = 0', params: [] as string[] };
+  const since = opts.now - 60 * DAY;
+  const rows = await db.getAllAsync<{ id: string; korean: string; meaning: string | null; mistakes: number; answers: number; lapses: number; parked: number }>(
+    `SELECT e.id, e.korean,
+       (SELECT text FROM entry_meanings WHERE entry_id = e.id ORDER BY position LIMIT 1) AS meaning,
+       (SELECT COUNT(*) FROM practice_attempts p WHERE p.entry_id = e.id AND p.is_correct = 0 AND p.created_at >= ?) AS mistakes,
+       (SELECT COUNT(*) FROM practice_attempts p WHERE p.entry_id = e.id AND p.created_at >= ?) AS answers,
+       (SELECT COALESCE(SUM(lapses), 0) FROM review_cards c WHERE c.entry_id = e.id) AS lapses,
+       (SELECT COUNT(*) FROM acquisition a WHERE a.entry_id = e.id AND a.errors >= ${PARKED_ERRORS}) AS parked
+     FROM entries e JOIN dictionaries d ON d.id = e.dictionary_id
+     WHERE ${s.sql}`,
+    [since, since, ...s.params],
+  );
+  return rows
+    .map((r) => ({ id: r.id, korean: r.korean, meaning: r.meaning, mistakes: r.mistakes, lapses: r.lapses, parked: r.parked > 0, answers: r.answers }))
+    .filter((w) => w.mistakes > 0 || w.lapses > 0 || w.parked)
+    .sort((a, b) => b.mistakes + 2 * b.lapses + (b.parked ? 3 : 0) - (a.mistakes + 2 * a.lapses + (a.parked ? 3 : 0)) || b.answers - a.answers)
+    .slice(0, opts.limit);
+}
+
+/** Cards for a free-practice session with their stored state. Changes nothing. */
+export async function planFreePractice(db: Db, opts: FreePlanOptions): Promise<FreeSeed[]> {
+  let entryIds: string[];
+  if (opts.source.kind === 'entries') {
+    entryIds = opts.source.ids.slice(0, opts.limit);
+  } else if (opts.source.kind === 'hard') {
+    entryIds = (await getDifficultWords(db, { dictionaryIds: opts.source.dictionaryIds, limit: opts.limit, now: opts.now })).map((w) => w.id);
+  } else {
+    const ids = opts.source.ids;
+    const s = ids.length ? { sql: `d.id IN (${placeholders(ids.length)})`, params: ids } : { sql: 'd.is_archived = 0', params: [] as string[] };
+    // Words practised least recently first, so repeated free sessions go through the whole dictionary.
+    const rows = await db.getAllAsync<{ id: string }>(
+      `SELECT e.id FROM entries e JOIN dictionaries d ON d.id = e.dictionary_id WHERE ${s.sql}
+       ORDER BY (SELECT MAX(created_at) FROM practice_attempts p WHERE p.entry_id = e.id) IS NOT NULL,
+                (SELECT MAX(created_at) FROM practice_attempts p WHERE p.entry_id = e.id), e.created_at, e.rowid
+       LIMIT ?`,
+      [...s.params, opts.limit],
+    );
+    entryIds = rows.map((r) => r.id);
+  }
+  const seeds: FreeSeed[] = [];
+  for (const d of DIRECTIONS.filter((x) => opts.directions.includes(x))) {
+    for (const id of entryIds) {
+      const entry = await db.getFirstAsync<{ introduced_at: number | null }>('SELECT introduced_at FROM entries WHERE id = ?', [id]);
+      if (!entry) continue;
+      const card = await db.getFirstAsync<{ due: number }>('SELECT due FROM review_cards WHERE entry_id = ? AND skill = ?', [id, d]);
+      const training = await db.getFirstAsync('SELECT 1 AS x FROM acquisition WHERE entry_id = ? AND direction = ?', [id, d]);
+      seeds.push({
+        entryId: id,
+        direction: d,
+        status: card ? 'scheduled' : training ? 'training' : 'new',
+        due: !!card && card.due <= opts.now,
+        introduced: entry.introduced_at !== null || !!card,
+      });
+    }
+  }
+  return seeds;
+}
+
+/** Records the FSRS configuration id the first time; returns the stored id (differs from the code's after a config change). */
+export async function ensureFsrsConfig(db: Db): Promise<string> {
+  await db.runAsync('INSERT INTO user_preferences (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING', [FSRS_CONFIG_PREF_KEY, JSON.stringify(FSRS_CONFIG.id)]);
+  const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM user_preferences WHERE key = ?', [FSRS_CONFIG_PREF_KEY]);
+  return JSON.parse(row?.value ?? 'null');
 }
 
 // ---------- Statistics ----------
@@ -782,7 +989,7 @@ export async function getForecast(db: Db, now: number, days: number): Promise<{ 
  * Accuracy kept apart by kind of knowledge: recognition (choosing from options)
  * and recall in each direction (typing the answer). They are never merged into one score.
  */
-export type AccuracyKind = 'recognition' | 'ko_ru' | 'ru_ko';
+export type AccuracyKind = 'recognition' | 'ko_ru' | 'ru_ko' | 'listening' | 'writing';
 
 export interface Accuracy {
   kind: AccuracyKind;
@@ -790,13 +997,15 @@ export interface Accuracy {
   correct: number;
 }
 
-export async function getAccuracy(db: Db): Promise<Accuracy[]> {
+/** Accuracy per skill. Planned study and free practice are counted separately. */
+export async function getAccuracy(db: Db, opts: { sessionKind?: SessionKind } = {}): Promise<Accuracy[]> {
   const rows = await db.getAllAsync<{ kind: string; total: number; correct: number }>(
-    `SELECT CASE WHEN mode = 'recognition' THEN 'recognition' ELSE skill END AS kind, COUNT(*) AS total, SUM(is_correct) AS correct
-     FROM practice_attempts GROUP BY kind`,
-    [],
+    `SELECT CASE WHEN learning_skill IN ('recognition', 'listening', 'writing') THEN learning_skill ELSE skill END AS kind,
+       COUNT(*) AS total, SUM(is_correct) AS correct
+     FROM practice_attempts WHERE session_kind = ? GROUP BY kind`,
+    [opts.sessionKind ?? 'scheduled'],
   );
-  const order: AccuracyKind[] = ['recognition', 'ko_ru', 'ru_ko'];
+  const order: AccuracyKind[] = ['recognition', 'ko_ru', 'ru_ko', 'listening', 'writing'];
   return order.flatMap((kind) => {
     const r = rows.find((x) => x.kind === kind);
     return r ? [{ kind, total: r.total, correct: r.correct }] : [];
@@ -835,7 +1044,8 @@ export async function savePreference(db: Db, key: string, value: string): Promis
 
 // ---------- Backup ----------
 
-export const BACKUP_VERSION = 2;
+export const BACKUP_VERSION = 3;
+const SUPPORTED_BACKUPS = [1, 2, 3];
 
 export interface Backup {
   format: 'namu-backup';
@@ -845,20 +1055,44 @@ export interface Backup {
 }
 
 const PRIMARY_KEYS: Record<string, string[]> = { entry_tags: ['entry_id', 'tag'], user_preferences: ['key'], acquisition: ['entry_id', 'direction'] };
-/** Values for NOT NULL columns that older backups do not have. */
-const COLUMN_DEFAULTS: Record<string, string | number> = { self_accepted: 0 };
+/** Values for NOT NULL columns that older backups do not have, by table.column. */
+const COLUMN_DEFAULTS: Record<string, string | number> = {
+  'practice_attempts.self_accepted': 0,
+  'practice_attempts.session_kind': 'scheduled',
+  'practice_attempts.typo_corrected': 0,
+  'practice_sessions.kind': 'scheduled',
+};
 
 export async function exportBackup(db: Db, now = Date.now()): Promise<Backup> {
   const tables: Backup['tables'] = {};
   for (const [name, columns] of Object.entries(TABLES)) {
-    tables[name] = await db.getAllAsync(`SELECT ${columns.join(', ')} FROM ${name}`, []);
+    // Ordered by key so the same data always gives the same file.
+    tables[name] = await db.getAllAsync(`SELECT ${columns.join(', ')} FROM ${name} ORDER BY ${(PRIMARY_KEYS[name] ?? ['id']).join(', ')}`, []);
   }
   return { format: 'namu-backup', version: BACKUP_VERSION, exportedAt: now, tables };
 }
 
-/** Version 1 used the skill names of flashcards and typing. */
+/** Brings an older backup to the current format, one version at a time. */
 function upgradeBackup(b: Backup): Backup {
-  if (b.version >= 2) return b;
+  let out = b;
+  if (out.version === 1) out = upgradeV1(out);
+  if (out.version === 2) out = upgradeV2(out);
+  return out;
+}
+
+/** Version 2 had no answer method or learning skill: recognition was a choice, everything else was typed. */
+function upgradeV2(b: Backup): Backup {
+  const tables = { ...b.tables };
+  tables.practice_attempts = (tables.practice_attempts ?? []).map((r) => ({
+    ...r,
+    method: r.method ?? (r.mode === 'recognition' ? 'choice' : 'keyboard'),
+    learning_skill: r.learning_skill ?? (r.mode === 'recognition' ? 'recognition' : 'recall'),
+  }));
+  return { ...b, version: 3, tables };
+}
+
+/** Version 1 used the skill names of flashcards and typing. */
+function upgradeV1(b: Backup): Backup {
   const skill: Record<string, string> = { recall: 'ko_ru', typing: 'ru_ko' };
   const mode: Record<string, string> = { cards: 'review', typing: 'review' };
   const tables = { ...b.tables };
@@ -870,7 +1104,7 @@ function upgradeBackup(b: Backup): Backup {
       return row;
     });
   }
-  return { ...b, version: BACKUP_VERSION, tables };
+  return { ...b, version: 2, tables };
 }
 
 export function parseBackup(json: string): Backup {
@@ -882,7 +1116,7 @@ export function parseBackup(json: string): Backup {
   }
   const b = data as Partial<Backup> | null;
   if (!b || b.format !== 'namu-backup' || typeof b.tables !== 'object' || b.tables === null) throw new Error('not_backup');
-  if (b.version !== 1 && b.version !== 2) throw new Error('unsupported_version');
+  if (typeof b.version !== 'number' || !SUPPORTED_BACKUPS.includes(b.version)) throw new Error('unsupported_version');
   for (const [name, rows] of Object.entries(b.tables)) {
     if (!Array.isArray(rows)) throw new Error('not_backup');
     if (!(name in TABLES)) continue;
@@ -916,7 +1150,11 @@ export async function restoreBackup(db: Db, backup: Backup): Promise<number> {
         if (name === 'review_cards') {
           await db.runAsync('DELETE FROM review_cards WHERE entry_id = ? AND skill = ? AND id != ?', [row.entry_id ?? null, row.skill ?? null, row.id ?? null]);
         }
-        await db.runAsync(sql, columns.map((c) => row[c] ?? COLUMN_DEFAULTS[c] ?? null));
+        // A card that is already scheduled cannot go back to training (the database refuses it).
+        if (name === 'acquisition' && (await db.getFirstAsync('SELECT 1 AS x FROM review_cards WHERE entry_id = ? AND skill = ?', [row.entry_id ?? null, row.direction ?? null]))) {
+          continue;
+        }
+        await db.runAsync(sql, columns.map((c) => row[c] ?? COLUMN_DEFAULTS[`${name}.${c}`] ?? null));
         count++;
       }
     }

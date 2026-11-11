@@ -169,6 +169,38 @@ export const MIGRATIONS: string[] = [
   CREATE INDEX idx_entries_introduced ON entries(introduced_at);
   CREATE INDEX idx_attempts_time ON practice_attempts(created_at);
   `,
+  // v3: one result format for every exercise, idempotent FSRS events, free practice.
+  `
+  ALTER TABLE practice_attempts ADD COLUMN method TEXT;
+  ALTER TABLE practice_attempts ADD COLUMN learning_skill TEXT;
+  ALTER TABLE practice_attempts ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'scheduled';
+  ALTER TABLE practice_attempts ADD COLUMN typo_corrected INTEGER NOT NULL DEFAULT 0;
+  -- Before v3 every recognition answer was a choice and every other answer was typed.
+  UPDATE practice_attempts SET method = CASE WHEN mode = 'recognition' THEN 'choice' ELSE 'keyboard' END WHERE method IS NULL;
+  UPDATE practice_attempts SET learning_skill = CASE WHEN mode = 'recognition' THEN 'recognition' ELSE 'recall' END WHERE learning_skill IS NULL;
+  CREATE INDEX idx_attempts_entry ON practice_attempts(entry_id, skill);
+  CREATE INDEX idx_attempts_kind ON practice_attempts(session_kind, learning_skill);
+
+  -- Every FSRS rating comes from exactly one attempt: the attempt id is the event id.
+  ALTER TABLE review_history ADD COLUMN event_id TEXT;
+  CREATE UNIQUE INDEX ux_history_event ON review_history(event_id) WHERE event_id IS NOT NULL;
+
+  ALTER TABLE practice_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'scheduled';
+
+  -- A card is either in training or scheduled, never both.
+  DELETE FROM acquisition WHERE EXISTS (SELECT 1 FROM review_cards c WHERE c.entry_id = acquisition.entry_id AND c.skill = acquisition.direction);
+  CREATE TRIGGER trg_acquisition_insert_unscheduled BEFORE INSERT ON acquisition
+  WHEN EXISTS (SELECT 1 FROM review_cards c WHERE c.entry_id = NEW.entry_id AND c.skill = NEW.direction)
+  BEGIN SELECT RAISE(ABORT, 'card_already_scheduled'); END;
+  CREATE TRIGGER trg_acquisition_update_unscheduled BEFORE UPDATE ON acquisition
+  WHEN EXISTS (SELECT 1 FROM review_cards c WHERE c.entry_id = NEW.entry_id AND c.skill = NEW.direction)
+  BEGIN SELECT RAISE(ABORT, 'card_already_scheduled'); END;
+  CREATE TRIGGER trg_card_ends_training AFTER INSERT ON review_cards
+  BEGIN DELETE FROM acquisition WHERE entry_id = NEW.entry_id AND direction = NEW.skill; END;
+
+  -- Cards stored so far were scheduled with this FSRS configuration (see src/core/fsrsConfig.ts).
+  INSERT INTO user_preferences (key, value) VALUES ('fsrsConfigId', '"namu-fsrs-1"') ON CONFLICT(key) DO NOTHING;
+  `,
 ];
 
 /** Columns of every table, in backup order (parents before children). */
@@ -180,11 +212,11 @@ export const TABLES: Record<string, string[]> = {
   entry_meanings: ['id', 'entry_id', 'text', 'position'],
   entry_examples: ['id', 'entry_id', 'korean', 'translation', 'position'],
   entry_tags: ['entry_id', 'tag'],
-  acquisition: ['entry_id', 'direction', 'phase', 'errors', 'updated_at'],
   review_cards: ['id', 'entry_id', 'skill', 'due', 'stability', 'difficulty', 'elapsed_days', 'scheduled_days', 'learning_steps', 'reps', 'lapses', 'state', 'last_review'],
-  practice_sessions: ['id', 'mode', 'dictionary_ids', 'started_at', 'finished_at', 'total', 'correct'],
-  review_history: ['id', 'entry_id', 'skill', 'session_id', 'rating', 'state', 'due', 'stability', 'difficulty', 'elapsed_days', 'scheduled_days', 'reviewed_at', 'duration_ms'],
-  practice_attempts: ['id', 'session_id', 'entry_id', 'skill', 'mode', 'is_correct', 'rating', 'answer_given', 'hints_used', 'duration_ms', 'created_at', 'self_accepted'],
+  acquisition: ['entry_id', 'direction', 'phase', 'errors', 'updated_at'],
+  practice_sessions: ['id', 'mode', 'dictionary_ids', 'started_at', 'finished_at', 'total', 'correct', 'kind'],
+  review_history: ['id', 'entry_id', 'skill', 'session_id', 'rating', 'state', 'due', 'stability', 'difficulty', 'elapsed_days', 'scheduled_days', 'reviewed_at', 'duration_ms', 'event_id'],
+  practice_attempts: ['id', 'session_id', 'entry_id', 'skill', 'mode', 'is_correct', 'rating', 'answer_given', 'hints_used', 'duration_ms', 'created_at', 'self_accepted', 'method', 'learning_skill', 'session_kind', 'typo_corrected'],
   user_preferences: ['key', 'value'],
 };
 

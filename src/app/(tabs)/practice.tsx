@@ -2,7 +2,7 @@ import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { getDb } from '../../db';
-import { getPlanCounts, listDictionaries, savePreference } from '../../db/repo';
+import { getDifficultWords, getPlanCounts, listDictionaries, savePreference } from '../../db/repo';
 import { directionList, useApp, type DirectionSetting } from '../../state/store';
 import { Body, Btn, Card, Chip, Empty, Icon, Screen, Section, Title, type IconName } from '../../ui/components';
 import { useT, type StringKey } from '../../ui/i18n';
@@ -28,7 +28,8 @@ export default function Practice() {
     const dictionaries = await listDictionaries(db, now);
     const ids = selected.filter((id) => dictionaries.some((d) => d.id === id));
     const counts = await getPlanCounts(db, { dictionaryIds: ids, directions: directionList(settings.directions), now, newPerDay: settings.newPerDay, maxReviews: settings.maxReviews });
-    return { dictionaries, counts, ids };
+    const hard = (await getDifficultWords(db, { dictionaryIds: ids, limit: 200, now })).length;
+    return { dictionaries, counts, ids, hard };
   }, [selected.join(','), settings.directions, settings.newPerDay, settings.maxReviews]);
 
   const toggle = (id: string) => setSelected((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
@@ -36,6 +37,11 @@ export default function Practice() {
   const setDirections = (directions: DirectionSetting) => {
     patchSettings({ directions });
     getDb().then((db) => savePreference(db, 'directions', JSON.stringify(directions))).catch(() => {});
+  };
+
+  const setMethod = (answerMethod: 'keyboard' | 'self_grade') => {
+    patchSettings({ answerMethod });
+    getDb().then((db) => savePreference(db, 'answerMethod', JSON.stringify(answerMethod))).catch(() => {});
   };
 
   if (data && data.dictionaries.length === 0) {
@@ -54,6 +60,8 @@ export default function Practice() {
   return (
     <Screen top>
       <Title>{tr('tabPractice')}</Title>
+      <Text style={[styles.blockTitle, { color: t.text }]}>{tr('plannedTitle')}</Text>
+      <Body dim>{tr('plannedHint')}</Body>
       <Section>{tr('practiceWhat')}</Section>
       <View style={styles.chips}>
         <Chip label={tr('allDictionaries')} active={selected.length === 0} onPress={() => setSelected([])} />
@@ -91,8 +99,24 @@ export default function Practice() {
         </View>
       ))}
 
+      <Section>{tr('answerMethod')}</Section>
+      <View style={styles.chips}>
+        <Chip label={tr('methodKeyboard')} active={settings.answerMethod === 'keyboard'} onPress={() => setMethod('keyboard')} />
+        <Chip label={tr('methodSelf')} active={settings.answerMethod === 'self_grade'} onPress={() => setMethod('self_grade')} />
+      </View>
+      <Body dim>{settings.answerMethod === 'keyboard' ? tr('methodKeyboardHint') : tr('methodSelfHint')}</Body>
+
       <Card>{data ? lines.length > 0 ? lines.map((l, i) => <Body key={i}>{l as string}</Body>) : <Body dim>{tr('nothingToStudyText')}</Body> : null}</Card>
       <Btn title={tr('start')} icon="play" disabled={total === 0} onPress={() => router.push(`/study?dicts=${(data?.ids ?? []).join(',')}`)} />
+
+      <Text style={[styles.blockTitle, { color: t.text }]}>{tr('freeTitle')}</Text>
+      <Body dim>{tr('freeHint')}</Body>
+      <Btn kind="soft" icon="tune-variant" title={tr('freeOpen')} onPress={() => router.push('/free')} />
+
+      <Text style={[styles.blockTitle, { color: t.text }]}>{tr('hardTitle')}</Text>
+      <Body dim>{tr('hardHint')}</Body>
+      <Body>{data ? (data.hard > 0 ? tr('hardCount', { n: data.hard }) : tr('hardNone')) : ''}</Body>
+      <Btn kind="soft" icon="fire" title={tr('hardStart')} disabled={!data || data.hard === 0} onPress={() => router.push('/free?source=hard')} />
 
       <Section>{tr('howItWorks')}</Section>
       <Body dim>{tr('howItWorksText')}</Body>
@@ -106,4 +130,5 @@ const styles = StyleSheet.create({
   mode: { flexDirection: 'row', alignItems: 'center', gap: space.md, padding: space.md, borderRadius: radius.md, borderWidth: 1, minHeight: 64 },
   modeTitle: { fontSize: 16, fontWeight: '600' },
   modeText: { fontSize: 13 },
+  blockTitle: { fontSize: 20, fontWeight: '700', marginTop: space.md },
 });

@@ -1,5 +1,6 @@
 // Spaced repetition on top of FSRS. Pure logic: no database, no UI.
 import { createEmptyCard, fsrs, generatorParameters, Rating, State, type Card, type Grade } from 'ts-fsrs';
+import { clampRetention, FSRS_CONFIG } from './fsrsConfig';
 
 export { Rating, State };
 
@@ -41,11 +42,29 @@ export const GRADES: Grade[] = [Rating.Again, Rating.Hard, Rating.Good, Rating.E
 /** A card counts as firmly remembered once its memory stability reaches this many days. */
 export const STABLE_DAYS = 21;
 
-// The app trains new and forgotten words itself inside a session, so FSRS's own
-// minute-level learning steps are switched off: every rating moves the card by days.
+/** FSRS parameters for a retention target, built only from FSRS_CONFIG (never from library defaults). */
+export function schedulerParams(retention: number) {
+  return generatorParameters({
+    request_retention: clampRetention(retention),
+    w: [...FSRS_CONFIG.w],
+    learning_steps: [...FSRS_CONFIG.learningSteps] as never[],
+    relearning_steps: [...FSRS_CONFIG.relearningSteps] as never[],
+    enable_short_term: FSRS_CONFIG.enableShortTerm,
+    enable_fuzz: FSRS_CONFIG.enableFuzz,
+    maximum_interval: FSRS_CONFIG.maximumInterval,
+  });
+}
+
+// One scheduler per retention value; building one is not free.
+const schedulers = new Map<number, ReturnType<typeof fsrs>>();
 function scheduler(retention: number) {
-  const r = Math.min(0.97, Math.max(0.7, retention));
-  return fsrs(generatorParameters({ request_retention: r, enable_fuzz: true, learning_steps: [], relearning_steps: [] }));
+  const r = clampRetention(retention);
+  let s = schedulers.get(r);
+  if (!s) {
+    s = fsrs(schedulerParams(r));
+    schedulers.set(r, s);
+  }
+  return s;
 }
 
 function toFsrs(c: CardState): Card {

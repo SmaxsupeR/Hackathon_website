@@ -30,3 +30,32 @@ export function openTestDb(): Db {
     },
   };
 }
+
+/** A database in a file, for migration tests on a copy of a stored fixture. */
+export function openFileDb(path: string): Db {
+  const raw = new DatabaseSync(path);
+  return {
+    async execAsync(sql) {
+      raw.exec(sql);
+    },
+    async runAsync(sql, params) {
+      return raw.prepare(sql).run(...params);
+    },
+    async getAllAsync<T>(sql: string, params: (string | number | null)[]) {
+      return raw.prepare(sql).all(...params) as T[];
+    },
+    async getFirstAsync<T>(sql: string, params: (string | number | null)[]) {
+      return (raw.prepare(sql).get(...params) as T | undefined) ?? null;
+    },
+    async withTransactionAsync(task) {
+      raw.exec('BEGIN');
+      try {
+        await task();
+        raw.exec('COMMIT');
+      } catch (e) {
+        raw.exec('ROLLBACK');
+        throw e;
+      }
+    },
+  };
+}

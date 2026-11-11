@@ -6,7 +6,7 @@ import { useT, WEEKDAYS, type StringKey, type T } from '../../ui/i18n';
 import { space, useTheme } from '../../ui/theme';
 import { useLoad } from '../../ui/useLoad';
 
-const ACCURACY_LABEL: Record<AccuracyKind, StringKey> = { recognition: 'accRecognition', ko_ru: 'accKoRu', ru_ko: 'accRuKo' };
+const ACCURACY_LABEL: Record<AccuracyKind, StringKey> = { recognition: 'accRecognition', ko_ru: 'accKoRu', ru_ko: 'accRuKo', listening: 'accListening', writing: 'accWriting' };
 
 function duration(tr: T, ms: number): string {
   const minutes = Math.round(ms / 60000);
@@ -19,14 +19,15 @@ export default function Progress() {
   const lang = useApp((s) => s.settings.language);
   const { data } = useLoad(async (db) => {
     const now = Date.now();
-    const [overview, activity, forecast, accuracy, hardest] = await Promise.all([
+    const [overview, activity, forecast, accuracy, freeAccuracy, hardest] = await Promise.all([
       getOverview(db, now),
       getDailyActivity(db, now, 7),
       getForecast(db, now, 7),
       getAccuracy(db),
+      getAccuracy(db, { sessionKind: 'free' }),
       getHardestWords(db, 8),
     ]);
-    return { overview, activity, forecast, accuracy, hardest };
+    return { overview, activity, forecast, accuracy, freeAccuracy, hardest };
   });
 
   if (!data) {
@@ -36,7 +37,7 @@ export default function Progress() {
       </Screen>
     );
   }
-  const { overview: o, activity, forecast, accuracy, hardest } = data;
+  const { overview: o, activity, forecast, accuracy, freeAccuracy, hardest } = data;
   const weekday = (ts: number) => WEEKDAYS[lang][new Date(ts).getDay()];
 
   return (
@@ -91,6 +92,24 @@ export default function Progress() {
               </View>
             ))}
             <Body dim>{tr('accuracyNote')}</Body>
+          </Card>
+        </>
+      ) : null}
+
+      {freeAccuracy.length > 0 ? (
+        <>
+          <Section>{tr('freePracticeStats')}</Section>
+          <Card>
+            {freeAccuracy.map((a) => (
+              <View key={a.kind} style={styles.accuracy}>
+                <Row style={styles.between}>
+                  <Text style={{ color: t.text, fontWeight: '600' }}>{tr(ACCURACY_LABEL[a.kind])}</Text>
+                  <Text style={{ color: t.textDim }}>{`${Math.round((a.correct / a.total) * 100)}% · ${a.total}`}</Text>
+                </Row>
+                <Bar value={a.correct / a.total} />
+              </View>
+            ))}
+            <Body dim>{tr('freeNoScheduleNote')}</Body>
           </Card>
         </>
       ) : null}

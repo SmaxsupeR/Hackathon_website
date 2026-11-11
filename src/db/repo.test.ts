@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { answer, completeIntro, createSession, currentTask, GRADE, type Direction, type Session } from '../core/learning';
-import { Rating, State } from '../core/scheduler';
+import { newCard, Rating, reviewCard, State } from '../core/scheduler';
 import * as repo from './repo';
 import { migrate, MIGRATIONS, TABLES, type Db } from './schema';
 import { openTestDb } from './testing';
@@ -208,7 +208,9 @@ describe('study plan', () => {
     expect(card?.state).toBe(State.Review);
     expect(await db.getAllAsync('SELECT rating, skill FROM review_history', [])).toEqual([{ rating: GRADE.hard, skill: 'ko_ru' }]);
     expect(await count('SELECT COUNT(*) AS n FROM acquisition')).toBe(0);
-    expect(Math.round(((card?.due ?? 0) - (NOW + 3000)) / DAY)).toBe(1);
+    // The interval is the algorithm's: the same as FSRS gives a new card rated Hard at that moment.
+    expect(card?.due).toBe(reviewCard(newCard(NOW + 3000), GRADE.hard, NOW + 3000, 0.9).card.due);
+    expect((card?.due ?? 0) - (NOW + 3000)).toBeGreaterThanOrEqual(DAY);
     expect(s.queue).toEqual([]);
   });
 
@@ -223,8 +225,8 @@ describe('study plan', () => {
       s = await step(s, !wrong, NOW + 5000);
     }
     const days = async (id: string) => Math.round((((await repo.getCard(db, id, 'ko_ru'))?.due ?? 0) - NOW) / DAY);
-    expect(await days(ids[0])).toBe(2); // Good
-    expect(await days(ids[1])).toBe(1); // Hard
+    expect(await days(ids[0])).toBeGreaterThan(await days(ids[1])); // Good comes back later than Hard
+    expect(await days(ids[1])).toBeGreaterThanOrEqual(1); // no minute-level steps
   });
 
   it('leaving in the middle keeps every step; the next session continues from the same stage', async () => {
@@ -261,6 +263,17 @@ describe('study plan', () => {
     expect((await plan(later, { dictionaryIds: [dict] })).reviews).toHaveLength(1);
   });
 
+  it('after one direction of a word was reviewed today, the other waits until tomorrow', async () => {
+    const { ids } = await seed([['나무', 'дерево']]);
+    for (const d of BOTH) await repo.recordReview(db, { entryId: ids[0], skill: d, mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
+    const later = NOW + 30 * DAY;
+    let s = await startFromPlan(later);
+    expect(s.queue).toHaveLength(1);
+    s = await step(s, true, later + 1000);
+    expect((await plan(later + 2000)).reviews).toEqual([]);
+    expect((await plan(later + DAY)).reviews).toHaveLength(1);
+  });
+
   it('starts the second direction for a word whose first direction is already scheduled', async () => {
     const { ids } = await seed([['나무', 'дерево']]);
     await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
@@ -273,6 +286,7 @@ describe('study plan', () => {
     const { ids } = await seed([['나무', 'дерево']]);
     await repo.recordReview(db, { entryId: ids[0], skill: 'ko_ru', mode: 'review', rating: Rating.Good, now: NOW, retention: 0.9 });
     const later = NOW + 10 * DAY;
+    const before = (await repo.getCard(db, ids[0], 'ko_ru')) as NonNullable<Awaited<ReturnType<typeof repo.getCard>>>;
     let s = await startFromPlan(later, { directions: ['ko_ru'] });
     s = await step(s, false, later);
     s = await step(s, false, later + 1000);
@@ -288,7 +302,9 @@ describe('study plan', () => {
     ]);
     const card = await repo.getCard(db, ids[0], 'ko_ru');
     expect(card?.lapses).toBe(1);
-    expect(Math.round(((card?.due ?? 0) - later) / DAY)).toBe(1);
+    // The new interval is exactly the algorithm's answer to Again, and shorter than the time that passed.
+    expect(card?.due).toBe(reviewCard(before, GRADE.again, later, 0.9).card.due);
+    expect((card?.due ?? 0) - later).toBeLessThan(later - NOW);
   });
 
   it('applyEffects is atomic', async () => {
@@ -355,7 +371,8 @@ describe('preferences and backup', () => {
   it('stores preferences', async () => {
     await repo.savePreference(db, 'language', 'ru');
     await repo.savePreference(db, 'language', 'en');
-    expect(await repo.loadPreferences(db)).toEqual({ language: 'en' });
+    // Migration v3 also stores the FSRS configuration id here.
+    expect(await repo.loadPreferences(db)).toEqual({ language: 'en', fsrsConfigId: '"namu-fsrs-1"' });
   });
 
   it('restores dictionaries, training stages and review history into an empty database', async () => {

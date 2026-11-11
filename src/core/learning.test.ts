@@ -3,6 +3,7 @@ import {
   answer,
   BATCH,
   completeIntro,
+  createFreeSession,
   createSession,
   currentTask,
   GRADE,
@@ -23,7 +24,9 @@ function make(input: Partial<SessionInput>): Session {
 }
 
 const describeTask = (s: Session, t: Task) =>
-  t.kind === 'intro' ? `intro:${t.entryId}${t.repeat ? '*' : ''}` : `${t.kind === 'recognize' ? 'recognize' : t.purpose}:${s.cards[t.key].entryId}:${s.cards[t.key].direction}`;
+  t.kind === 'intro'
+    ? `intro:${t.entryId}${t.repeat ? '*' : ''}`
+    : `${t.kind === 'recognize' ? (s.cards[t.key].stage === 'practice' ? 'practice-choice' : 'recognize') : t.purpose}:${s.cards[t.key].entryId}:${s.cards[t.key].direction}`;
 
 /**
  * Plays a session to the end. `decide` returns whether the learner answers the current question right.
@@ -245,5 +248,51 @@ describe('session summary', () => {
   it('counts learned words once, even when both directions finish', () => {
     const { session } = play(make({ fresh: ['a', 'b'] }));
     expect(session.stats).toMatchObject({ introduced: 2, graduated: 4, learnedWords: ['a', 'b'], answers: 8, correct: 8 });
+  });
+});
+
+describe('free practice sessions', () => {
+  const seed = (entryId: string, direction: 'ko_ru' | 'ru_ko', status: 'new' | 'training' | 'scheduled' = 'scheduled', due = false, introduced = true) => ({ entryId, direction, status, due, introduced });
+
+  it('trains any direction at once, without unlocking, and changes nothing but statistics', () => {
+    const s = createFreeSession({ cards: [seed('a', 'ru_ko', 'new', false, false), seed('b', 'ru_ko', 'training')], method: 'keyboard' });
+    const { steps, effects } = play(s);
+    expect(steps).toEqual(['intro:a*', 'practice:a:ru_ko', 'practice:b:ru_ko']);
+    expect(effects.map((e) => e.type)).toEqual(['attempt', 'attempt']);
+    expect(ofType(effects, 'attempt').every((a) => a.mode === 'practice' && a.result?.sessionKind === 'free')).toBe(true);
+  });
+
+  it('asks a wrong card again later, up to the attempt limit', () => {
+    const cards = ['a', 'b', 'c', 'd'].map((id) => seed(id, 'ko_ru'));
+    const { steps } = play(createFreeSession({ cards, method: 'keyboard', maxFails: 5 }), (step) => !step.includes(':a:'));
+    expect(steps.filter((x) => x === 'practice:a:ko_ru')).toHaveLength(5);
+    const first = steps.indexOf('practice:a:ko_ru');
+    expect(steps[first + 1]).not.toBe('practice:a:ko_ru');
+  });
+
+  it('uses multiple choice when options exist and falls back to typing when they do not', () => {
+    const s = createFreeSession({ cards: [seed('a', 'ko_ru'), seed('b', 'ko_ru')], method: 'choice', hasChoice: (id) => id === 'a' });
+    expect(s.queue.map((t) => t.kind)).toEqual(['recognize', 'recall']);
+    const r = answer(s, true);
+    expect(r.result).toMatchObject({ method: 'choice', skill: 'recognition', sessionKind: 'free' });
+  });
+
+  it('counts a due review only when asked, only once, and never for recognition', () => {
+    const cards = [seed('due', 'ko_ru', 'scheduled', true), seed('later', 'ko_ru', 'scheduled', false), seed('t', 'ko_ru', 'training')];
+    const off = play(createFreeSession({ cards, method: 'keyboard' }));
+    expect(ofType(off.effects, 'review')).toEqual([]);
+    let n = 0;
+    const on = play(createFreeSession({ cards, method: 'keyboard', countAsReview: true }), () => n++ !== 0);
+    expect(ofType(on.effects, 'review')).toEqual([{ type: 'review', entryId: 'due', direction: 'ko_ru', grade: GRADE.again }]);
+    const choice = play(createFreeSession({ cards, method: 'choice', countAsReview: true, hasChoice: () => true }));
+    expect(ofType(choice.effects, 'review')).toEqual([]);
+  });
+
+  it('never produces training-stage or graduation effects', () => {
+    const cards = [seed('n', 'ko_ru', 'new', false, false), seed('t', 'ru_ko', 'training'), seed('s', 'ko_ru', 'scheduled', true)];
+    for (const method of ['keyboard', 'self_grade', 'choice'] as const) {
+      const { effects } = play(createFreeSession({ cards, method, hasChoice: () => true, countAsReview: false }), () => false);
+      expect(effects.every((e) => e.type === 'attempt')).toBe(true);
+    }
   });
 });

@@ -19,6 +19,12 @@ export interface Settings {
   directions: DirectionSetting;
   strictSpacing: boolean;
   autoSpeak: boolean;
+  /** How recall questions are answered in planned study. */
+  answerMethod: 'keyboard' | 'self_grade';
+  /** Self-assessed cards: four grades instead of two. */
+  detailedGrading: boolean;
+  /** Free practice: attempts per word before it leaves the session. */
+  practiceAttempts: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -30,6 +36,9 @@ export const DEFAULT_SETTINGS: Settings = {
   directions: 'both',
   strictSpacing: false,
   autoSpeak: true,
+  answerMethod: 'keyboard',
+  detailedGrading: false,
+  practiceAttempts: 3,
 };
 
 export function settingsFromPrefs(prefs: Record<string, string>): Settings {
@@ -40,6 +49,8 @@ export function settingsFromPrefs(prefs: Record<string, string>): Settings {
       const value = JSON.parse(prefs[key]);
       if (typeof value !== typeof DEFAULT_SETTINGS[key]) continue;
       if (key === 'directions' && !['both', 'ko_ru', 'ru_ko'].includes(value)) continue;
+      if (key === 'answerMethod' && !['keyboard', 'self_grade'].includes(value)) continue;
+      if (key === 'practiceAttempts' && !(value >= 1 && value <= 10)) continue;
       (out as unknown as Record<string, unknown>)[key] = value;
     } catch {
       // A damaged value falls back to the default.
