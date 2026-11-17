@@ -1,0 +1,86 @@
+{
+ "01-silla": {
+  "A": "INT8 weights, 5 steps",
+  "B": "INT8 + FP16 vocoder, 8 steps",
+  "C": "original FP32, 8 steps",
+  "D": "INT8 weights, 8 steps"
+ },
+ "02-ikda": {
+  "A": "INT8 + FP16 vocoder, 8 steps",
+  "B": "INT8 weights, 5 steps",
+  "C": "original FP32, 8 steps",
+  "D": "INT8 weights, 8 steps"
+ },
+ "03-gachi": {
+  "A": "INT8 weights, 5 steps",
+  "B": "INT8 weights, 8 steps",
+  "C": "original FP32, 8 steps",
+  "D": "INT8 + FP16 vocoder, 8 steps"
+ },
+ "04-hangugeo": {
+  "A": "INT8 weights, 8 steps",
+  "B": "INT8 + FP16 vocoder, 8 steps",
+  "C": "original FP32, 8 steps",
+  "D": "INT8 weights, 5 steps"
+ },
+ "05-kkochi": {
+  "A": "original FP32, 8 steps",
+  "B": "INT8 weights, 5 steps",
+  "C": "INT8 weights, 8 steps",
+  "D": "INT8 + FP16 vocoder, 8 steps"
+ },
+ "06-uisa": {
+  "A": "INT8 weights, 8 steps",
+  "B": "original FP32, 8 steps",
+  "C": "INT8 + FP16 vocoder, 8 steps",
+  "D": "INT8 weights, 5 steps"
+ },
+ "07-joayo": {
+  "A": "INT8 + FP16 vocoder, 8 steps",
+  "B": "original FP32, 8 steps",
+  "C": "INT8 weights, 8 steps",
+  "D": "INT8 weights, 5 steps"
+ },
+ "08-gwaenchanayo": {
+  "A": "INT8 + FP16 vocoder, 8 steps",
+  "B": "original FP32, 8 steps",
+  "C": "INT8 weights, 5 steps",
+  "D": "INT8 weights, 8 steps"
+ },
+ "09-num_year": {
+  "A": "INT8 weights, 5 steps",
+  "B": "original FP32, 8 steps",
+  "C": "INT8 + FP16 vocoder, 8 steps",
+  "D": "INT8 weights, 8 steps"
+ },
+ "10-num_time": {
+  "A": "INT8 weights, 5 steps",
+  "B": "original FP32, 8 steps",
+  "C": "INT8 + FP16 vocoder, 8 steps",
+  "D": "INT8 weights, 8 steps"
+ },
+ "11-stmt_ate": {
+  "A": "INT8 weights, 5 steps",
+  "B": "INT8 + FP16 vocoder, 8 steps",
+  "C": "original FP32, 8 steps",
+  "D": "INT8 weights, 8 steps"
+ },
+ "12-q_ate": {
+  "A": "INT8 weights, 8 steps",
+  "B": "INT8 + FP16 vocoder, 8 steps",
+  "C": "INT8 weights, 5 steps",
+  "D": "original FP32, 8 steps"
+ },
+ "13-coffee": {
+  "A": "INT8 + FP16 vocoder, 8 steps",
+  "B": "INT8 weights, 5 steps",
+  "C": "original FP32, 8 steps",
+  "D": "INT8 weights, 8 steps"
+ },
+ "14-polite_long": {
+  "A": "original FP32, 8 steps",
+  "B": "INT8 + FP16 vocoder, 8 steps",
+  "C": "INT8 weights, 5 steps",
+  "D": "INT8 weights, 8 steps"
+ }
+}
