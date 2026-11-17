@@ -771,7 +771,24 @@ export async function recordReview(db: Db, input: ReviewInput): Promise<CardStat
 export type FreeSource =
   | { kind: 'dictionaries'; ids: string[] }
   | { kind: 'entries'; ids: string[] }
-  | { kind: 'hard'; dictionaryIds: string[] };
+  | { kind: 'hard'; dictionaryIds: string[] }
+  /** Words studied or shown today, to consolidate them. */
+  | { kind: 'today'; dictionaryIds: string[] };
+
+/** Words answered or shown today, in the order they were first met today. */
+export async function getTodayWordIds(db: Db, opts: { now: number; dictionaryIds?: string[]; limit?: number }): Promise<string[]> {
+  const ids = opts.dictionaryIds ?? [];
+  const s = ids.length ? { sql: `d.id IN (${placeholders(ids.length)})`, params: ids } : { sql: 'd.is_archived = 0', params: [] as string[] };
+  const today = startOfDay(opts.now);
+  const rows = await db.getAllAsync<{ id: string }>(
+    `SELECT e.id FROM entries e JOIN dictionaries d ON d.id = e.dictionary_id
+     WHERE ${s.sql} AND (e.introduced_at >= ? OR EXISTS (SELECT 1 FROM practice_attempts p WHERE p.entry_id = e.id AND p.created_at >= ?))
+     ORDER BY MIN(COALESCE(e.introduced_at, 9e15), COALESCE((SELECT MIN(created_at) FROM practice_attempts p WHERE p.entry_id = e.id AND p.created_at >= ?), 9e15)), e.rowid
+     LIMIT ?`,
+    [...s.params, today, today, today, opts.limit ?? 500],
+  );
+  return rows.map((r) => r.id);
+}
 
 export interface FreePlanOptions {
   source: FreeSource;
@@ -828,6 +845,8 @@ export async function planFreePractice(db: Db, opts: FreePlanOptions): Promise<F
   let entryIds: string[];
   if (opts.source.kind === 'entries') {
     entryIds = opts.source.ids.slice(0, opts.limit);
+  } else if (opts.source.kind === 'today') {
+    entryIds = await getTodayWordIds(db, { now: opts.now, dictionaryIds: opts.source.dictionaryIds, limit: opts.limit });
   } else if (opts.source.kind === 'hard') {
     entryIds = (await getDifficultWords(db, { dictionaryIds: opts.source.dictionaryIds, limit: opts.limit, now: opts.now })).map((w) => w.id);
   } else {

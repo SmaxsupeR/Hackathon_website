@@ -10,7 +10,7 @@ import { useT } from '../ui/i18n';
 import { radius, space, useTheme } from '../ui/theme';
 import { useLoad } from '../ui/useLoad';
 
-type Source = 'dicts' | 'entries' | 'hard';
+type Source = 'dicts' | 'entries' | 'hard' | 'today';
 type Dirs = 'both' | 'ko_ru' | 'ru_ko';
 type Method = 'keyboard' | 'self_grade' | 'choice';
 
@@ -23,7 +23,7 @@ export default function FreePractice() {
   const router = useRouter();
   const attempts = useApp((s) => s.settings.practiceAttempts);
   const patchSettings = useApp((s) => s.patchSettings);
-  const [source, setSource] = useState<Source>(params.source === 'hard' ? 'hard' : 'dicts');
+  const [source, setSource] = useState<Source>(params.source === 'hard' ? 'hard' : params.source === 'today' ? 'today' : 'dicts');
   const [dicts, setDicts] = useState<string[]>([]);
   const [picked, setPicked] = useState<string[]>([]);
   const [pickFrom, setPickFrom] = useState<string | null>(null);
@@ -94,6 +94,7 @@ export default function FreePractice() {
       <View style={styles.chips}>
         <Chip label={tr('sourceDicts')} active={source === 'dicts'} onPress={() => setSource('dicts')} />
         <Chip label={tr('sourceWords')} active={source === 'entries'} onPress={() => setSource('entries')} />
+        <Chip label={tr('sourceToday')} active={source === 'today'} onPress={() => setSource('today')} />
         <Chip label={tr('sourceHard')} active={source === 'hard'} onPress={() => setSource('hard')} />
       </View>
 

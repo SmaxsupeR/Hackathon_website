@@ -312,3 +312,25 @@ describe('no double FSRS events in mixed training', () => {
     }
   });
 });
+
+describe("consolidating today's words", () => {
+  it('offers the words studied today and practising them again leaves the schedule alone', async () => {
+    const at = NOW + 2 * DAY;
+    // Two words studied today, one long ago.
+    await schedule(ids[0], 'ko_ru', NOW - 30 * DAY);
+    await repo.applyEvent(db, [{ type: 'introduce', entryId: ids[1], directions: BOTH }], { now: at, retention: 0.9 });
+    await schedule(ids[2], 'ko_ru', at + 1000);
+    const today = await repo.getTodayWordIds(db, { now: at + 5000 });
+    expect(today).toEqual([ids[1], ids[2]]);
+    const before = await scheduleState();
+    const seeds = await repo.planFreePractice(db, { source: { kind: 'today', dictionaryIds: [] }, directions: BOTH, now: at + 5000, limit: 50 });
+    expect(new Set(seeds.map((x) => x.entryId))).toEqual(new Set([ids[1], ids[2]]));
+    let s = createFreeSession({ cards: seeds, method: 'keyboard' });
+    while (currentTask(s)) {
+      const r = currentTask(s)!.kind === 'intro' ? completeIntro(s) : answer(s, { correct: true, at: at + 6000 });
+      await repo.applyEvent(db, r.effects, { now: at + 6000, retention: 0.9 });
+      s = r.session;
+    }
+    expect(await scheduleState()).toEqual(before);
+  });
+});

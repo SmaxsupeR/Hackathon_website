@@ -71,7 +71,11 @@ export default function Home() {
         ) : (
           <>
             <Text style={[styles.big, { color: t.text }]}>{tr('allDone')}</Text>
-            <Body dim>{tr('allDoneHint')}</Body>
+            <Body dim>{overview.answersToday > 0 ? tr('consolidateHint') : tr('allDoneHint')}</Body>
+            {overview.answersToday > 0 ? (
+              <Btn title={tr('consolidateToday')} icon="repeat" onPress={() => router.push(`/study?kind=free&source=today&dirs=both&method=${settings.answerMethod}&limit=50`)} style={styles.gapTop} />
+            ) : null}
+            <Btn kind="ghost" small icon="tune-variant" title={tr('freeTitle')} onPress={() => router.push('/free')} />
           </>
         )}
       </Card>

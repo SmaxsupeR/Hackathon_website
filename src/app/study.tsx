@@ -8,7 +8,7 @@ import { buildChoiceOptions, checkChoice, checkKeyboard, checkSelfGrade } from '
 import { answer, cardKey, completeIntro, createFreeSession, createSession, currentTask, progress, type Card as LearnCard, type Direction, type Effect, type RecallMethod, type Session, type Task } from '../core/learning';
 import type { SelfGrade } from '../core/model';
 import { getDb } from '../db';
-import { applyEvent, finishSession, getDistractorPool, getEntries, planFreePractice, planSession, startSession, type Entry, type FreeSource } from '../db/repo';
+import { applyEvent, finishSession, getDistractorPool, getEntries, getTodayWordIds, planFreePractice, planSession, startSession, type Entry, type FreeSource } from '../db/repo';
 import { speakKorean } from '../services/speech';
 import { directionList, useApp } from '../state/store';
 import { Bar, Body, Btn, Card, Empty, Icon, IconBtn, Row } from '../ui/components';
@@ -55,6 +55,9 @@ type StudyParams = {
 };
 
 const SELF_GRADES_SIMPLE: SelfGrade[] = ['again', 'good'];
+
+/** Words of a session, in the order they were met. */
+const sessionWordIds = (s: Session) => [...new Set(Object.values(s.cards).map((c) => c.entryId))];
 const SELF_GRADES_DETAILED: SelfGrade[] = ['again', 'hard', 'good', 'easy'];
 
 export default function Study() {
@@ -82,6 +85,8 @@ export default function Study() {
   const startedAt = useRef(Date.now());
   const shownAt = useRef(Date.now());
   const pending = useRef<{ session: Session; given: string } | null>(null);
+  /** Words studied today, for the "consolidate" offer when the plan is empty. */
+  const todayWords = useRef(0);
 
   // Build the session once, when the screen opens.
   useEffect(() => {
@@ -104,7 +109,14 @@ export default function Study() {
       if (free) {
         const directions: Direction[] = params.dirs === 'ko_ru' || params.dirs === 'ru_ko' ? [params.dirs] : ['ko_ru', 'ru_ko'];
         const ids = (params.ids ?? '').split(',').filter(Boolean);
-        const source: FreeSource = params.source === 'entries' ? { kind: 'entries', ids } : params.source === 'hard' ? { kind: 'hard', dictionaryIds: dicts } : { kind: 'dictionaries', ids: dicts };
+        const source: FreeSource =
+          params.source === 'entries'
+            ? { kind: 'entries', ids }
+            : params.source === 'hard'
+              ? { kind: 'hard', dictionaryIds: dicts }
+              : params.source === 'today'
+                ? { kind: 'today', dictionaryIds: dicts }
+                : { kind: 'dictionaries', ids: dicts };
         const seeds = await planFreePractice(db, { source, directions, now, limit: Math.max(1, Number(params.limit) || 20) });
         await loadOptions([...new Set(seeds.map((x) => x.entryId))]);
         if (seeds.length > 0) sessionId.current = await startSession(db, params.source === 'hard' ? 'hard_words' : 'practice', dicts, now, 'free');
@@ -117,6 +129,7 @@ export default function Study() {
         if (plan.reviews.length + plan.learning.length + plan.fresh.length > 0) sessionId.current = await startSession(db, 'learn', dicts, now);
         s = createSession({ ...plan, directions, hasChoice, method: settings.answerMethod, sessionId: sessionId.current });
       }
+      todayWords.current = (await getTodayWordIds(db, { now, dictionaryIds: dicts })).length;
       shownAt.current = Date.now();
       setSession(s);
     })().catch((e: unknown) => Alert.alert(tr('error'), e instanceof Error ? e.message : String(e)));
@@ -278,6 +291,26 @@ export default function Study() {
     return () => sub.remove();
   }, [askLeave]);
 
+  /** Opens free practice of the given words (or of everything studied today), in both directions. */
+  const consolidate = async (ids: string[] | null) => {
+    try {
+      if (sessionId.current) await finishSession(await getDb(), sessionId.current);
+    } catch {
+      // Answers are already saved.
+    }
+    touch();
+    const q = new URLSearchParams({
+      kind: 'free',
+      source: ids ? 'entries' : 'today',
+      ids: (ids ?? []).join(','),
+      dicts: dicts.join(','),
+      dirs: 'both',
+      method: settings.answerMethod,
+      limit: String(ids ? ids.length : 50),
+    });
+    router.replace(`/study?${q.toString()}`);
+  };
+
   const header = (
     <Row style={[styles.header, { paddingTop: insets.top + space.sm }]}>
       <IconBtn name="close" label={tr('leave')} onPress={askLeave} />
@@ -298,7 +331,15 @@ export default function Study() {
       <View style={[styles.flex, { backgroundColor: t.bg, paddingBottom: insets.bottom + space.lg }]}>
         {header}
         <ScrollView contentContainerStyle={styles.body}>
-          {empty ? <Empty icon="calendar-check" title={tr('nothingToStudy')} text={tr('nothingToStudyText')} /> : <Empty icon="party-popper" title={tr('sessionDone')} />}
+          {empty ? (
+            session.kind === 'free' ? (
+              <Empty icon="text-box-search-outline" title={tr('freeEmpty')} />
+            ) : (
+              <Empty icon="calendar-check" title={tr('nothingToStudy')} text={tr('nothingToStudyText')} />
+            )
+          ) : (
+            <Empty icon="party-popper" title={tr('sessionDone')} />
+          )}
           {!empty ? (
             <View style={styles.summary}>
               {session.kind === 'free' ? (
@@ -320,6 +361,19 @@ export default function Study() {
           ) : null}
         </ScrollView>
         <View style={styles.footer}>
+          {/* Planned study is over for now; extra practice is free practice, which keeps the schedule intact. */}
+          {session.kind === 'scheduled' && !empty ? (
+            <>
+              <Body dim style={styles.center}>
+                {tr('consolidateHint')}
+              </Body>
+              <Btn kind="soft" icon="repeat" title={tr('consolidateSession')} onPress={() => consolidate(sessionWordIds(session))} />
+            </>
+          ) : null}
+          {session.kind === 'scheduled' && empty && todayWords.current > 0 ? (
+            <Btn kind="soft" icon="repeat" title={tr('consolidateToday')} onPress={() => consolidate(null)} />
+          ) : null}
+          {session.kind === 'scheduled' && empty ? <Btn kind="ghost" icon="tune-variant" title={tr('freeTitle')} onPress={() => router.replace('/free')} /> : null}
           <Btn title={tr('finish')} onPress={close} />
         </View>
       </View>
