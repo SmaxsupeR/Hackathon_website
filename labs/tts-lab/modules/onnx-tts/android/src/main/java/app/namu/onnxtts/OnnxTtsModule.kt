@@ -51,6 +51,24 @@ class OnnxTtsModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("OnnxTts")
 
+    Events("onDownloadProgress")
+
+    AsyncFunction("download") { url: String, dest: String, expectedSize: Double ->
+      try {
+        Downloader.download(url, path(dest), expectedSize.toLong()) { bytes, total ->
+          sendEvent("onDownloadProgress", mapOf("url" to url, "bytes" to bytes.toDouble(), "total" to total.toDouble()))
+        }.toDouble()
+      } catch (e: Downloader.HttpError) {
+        throw CodedException("E_HTTP_${e.status}", e.message, e)
+      } catch (e: InterruptedException) {
+        throw CodedException("E_CANCELLED", "Скачивание остановлено", e)
+      } catch (e: java.io.IOException) {
+        throw CodedException("E_NETWORK", "Сеть недоступна или соединение прервано: ${e.message}", e)
+      }
+    }
+
+    Function("cancelDownload") { Downloader.cancelled = true }
+
     AsyncFunction("deviceInfo") {
       val ctx = appContext.reactContext
       val am = ctx?.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager

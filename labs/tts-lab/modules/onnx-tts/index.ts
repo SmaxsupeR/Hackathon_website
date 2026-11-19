@@ -1,4 +1,4 @@
-import { requireNativeModule } from 'expo-modules-core';
+import { NativeModule, requireNativeModule } from 'expo-modules-core';
 
 export interface Memory {
   rssMb: number;
@@ -38,7 +38,20 @@ export interface SynthResult {
   memory: Memory;
 }
 
-interface OnnxTtsNative {
+export interface DownloadProgressEvent {
+  url: string;
+  bytes: number;
+  total: number;
+}
+
+type OnnxTtsEvents = {
+  onDownloadProgress: (e: DownloadProgressEvent) => void;
+};
+
+declare class OnnxTtsNative extends NativeModule<OnnxTtsEvents> {
+  /** Downloads a file with resume (HTTP Range); resolves with the bytes on disk. */
+  download(url: string, dest: string, expectedSize: number): Promise<number>;
+  cancelDownload(): void;
   deviceInfo(): Promise<DeviceInfo>;
   memory(): Promise<Memory>;
   sha256(file: string): Promise<string>;

@@ -12,4 +12,6 @@ python3 -m venv .venv && .venv/bin/pip install supertonic onnx onnxconverter-com
 .venv/bin/python make_pack.py variants/int8w int8w "INT8, сжатые веса" namu-voice-int8w.zip
 ```
 
+`DownloaderCheck.kt` — проверка загрузчика голосовых пакетов на JVM: скачивание, обрыв и докачка, переадресация Hugging Face, ошибки.
+
 `KotlinEngineCheck.kt` — запуск движка лаборатории (`labs/tts-lab/modules/onnx-tts/.../SupertonicEngine.kt`) на обычной JVM с настольным ONNX Runtime, чтобы проверить перенос без телефона.

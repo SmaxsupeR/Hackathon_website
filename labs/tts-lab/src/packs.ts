@@ -152,22 +152,20 @@ export async function downloadPack(p: PackInfo, base: string, onProgress: (p: Pr
   dir.create({ intermediates: true, idempotent: true });
   const total = packSize(p);
   let done = 0;
-  for (const f of p.files) {
-    if (shouldStop()) break;
-    const file = new File(dir, f.path);
-    file.parentDirectory.create({ intermediates: true, idempotent: true });
-    if (file.exists && file.size === f.size && (await OnnxTts.sha256(plainPath(file.uri))) === f.sha256) {
+  const sub = OnnxTts.addListener('onDownloadProgress', (e) => onProgress({ file: e.url.split('/').slice(-2).join('/'), done: done + e.bytes, total }));
+  try {
+    for (const f of p.files) {
+      if (shouldStop()) break;
+      const file = new File(dir, f.path);
+      file.parentDirectory.create({ intermediates: true, idempotent: true });
+      // A partly downloaded file is kept: the download continues from where it stopped.
+      if (file.exists && file.size === f.size && (await OnnxTts.sha256(plainPath(file.uri))) !== f.sha256) file.delete();
+      await OnnxTts.download(base + f.path, plainPath(file.uri), f.size);
       done += f.size;
       onProgress({ file: f.path, done, total });
-      continue;
     }
-    if (file.exists) file.delete();
-    const base = done;
-    const task = File.createDownloadTask(base + f.path, file, {
-      onProgress: ({ bytesWritten }) => onProgress({ file: f.path, done: base + bytesWritten, total }),
-    });
-    await task.downloadAsync();
-    done += f.size;
+  } finally {
+    sub.remove();
   }
   new File(dir, 'manifest.json').write(JSON.stringify(p));
   return verifyPack(p);

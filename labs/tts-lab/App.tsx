@@ -294,7 +294,7 @@ function Lab() {
       const totalSynth = items.reduce((n, it) => n + median(it.totalMs), 0);
       const totalAudio = items.reduce((n, it) => n + it.audioSec, 0);
       const r: Report = {
-        app: 'Namu TTS Lab 0.1.0',
+        app: 'Namu TTS Lab 0.1.1',
         date: new Date().toISOString(),
         device,
         pack: pack.name,
