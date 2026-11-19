@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, Share, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { OnnxTts, type DeviceInfo, type LoadResult, type Memory, type SynthResult } from './modules/onnx-tts';
-import { deletePack, downloadOriginal, importPack, installedPacks, ORIGINAL, packPath, packSize, verifyPack, voicesOf, type PackInfo, type Progress } from './src/packs';
+import { deletePack, downloadCatalogPack, downloadOriginal, fetchCatalog, importPack, installedPacks, ORIGINAL, packPath, packSize, verifyPack, voicesOf, type CatalogPack, type PackInfo, type Progress } from './src/packs';
 import { TEST_SET } from './src/testSet';
 
 const C = { bg: '#F6F7F4', card: '#FFFFFF', text: '#17201B', dim: '#5F6B64', border: '#DFE4DD', primary: '#2F9E6E', soft: '#DDF3E8', danger: '#D64545' };
@@ -84,6 +84,7 @@ function Lab() {
   const [mem, setMem] = useState<Memory | null>(null);
   const [report, setReport] = useState<Report | null>(null);
   const [log, setLog] = useState<string[]>([]);
+  const [catalog, setCatalog] = useState<CatalogPack[] | null>(null);
 
   const note = (m: string) => setLog((l) => [`${new Date().toLocaleTimeString()} ${m}`, ...l].slice(0, 40));
   const fail = (e: unknown) => {
@@ -103,6 +104,12 @@ function Lab() {
     OnnxTts.deviceInfo().then(setDevice).catch(fail);
     OnnxTts.memory().then(setMem).catch(() => {});
     refresh();
+    fetchCatalog()
+      .then(setCatalog)
+      .catch((e: Error) => {
+        setCatalog([]);
+        note(`Каталог пакетов недоступен (${e.message}). Без интернета работают уже скачанные пакеты.`);
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -115,6 +122,22 @@ function Lab() {
       const r = await downloadOriginal(setProgress, () => stop.current);
       note(r.ok ? 'Оригинал скачан и проверен' : `Скачано с ошибками: нет ${r.missing.length}, повреждено ${r.corrupt.length}`);
       refresh();
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(null);
+      setProgress(null);
+    }
+  };
+
+  const downloadFromCatalog = async (c: CatalogPack) => {
+    stop.current = false;
+    setBusy('download');
+    try {
+      const r = await downloadCatalogPack(c, setProgress, () => stop.current);
+      note(r.ok ? `${c.name}: скачан и проверен` : `${c.name}: нет ${r.missing.length}, повреждено ${r.corrupt.length}`);
+      refresh();
+      setPackId(c.id);
     } catch (e) {
       fail(e);
     } finally {
@@ -340,7 +363,11 @@ function Lab() {
           ))}
         </View>
         {progress ? <Text style={s.dim}>{progress.total ? `${progress.file}: ${mb(progress.done)} из ${mb(progress.total)}` : progress.file}</Text> : null}
-        <Btn title={`Скачать оригинал (${mb(packSize(ORIGINAL))})`} onPress={download} disabled={disabled} kind="soft" />
+        {catalog === null ? <Text style={s.dim}>Загружаю каталог пакетов…</Text> : null}
+        {catalog?.map((c) => (
+          <Btn key={c.id} title={`Скачать «${c.name}» (${mb(c.size)}) с GitHub`} onPress={() => downloadFromCatalog(c)} disabled={disabled} />
+        ))}
+        <Btn title={`Скачать оригинал (${mb(packSize(ORIGINAL))}) с Hugging Face`} onPress={download} disabled={disabled} kind="soft" />
         {busy === 'download' ? <Btn title="Остановить скачивание" onPress={() => (stop.current = true)} kind="danger" /> : null}
         <Btn title="Импортировать пакет (.zip)" onPress={importZip} disabled={disabled} kind="soft" />
         <View style={s.row}>

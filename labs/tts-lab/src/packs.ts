@@ -106,12 +106,48 @@ export interface Progress {
   total: number;
 }
 
+/** Catalog of Namu voice packs on GitHub (github.com/SmaxsupeR/namu-voices). */
+export const VOICES_INDEX = 'https://raw.githubusercontent.com/SmaxsupeR/namu-voices/main/index.json';
+
+export interface CatalogPack {
+  id: string;
+  version: number;
+  name: string;
+  path: string;
+  manifest: string;
+  size: number;
+  ref: string;
+  /** Where this pack's files live: base URL of the commit that published it. */
+  base: string;
+}
+
+/** Packs offered in the catalog. Needs internet; returns an empty list offline. */
+export async function fetchCatalog(): Promise<CatalogPack[]> {
+  const res = await fetch(VOICES_INDEX);
+  if (!res.ok) throw new Error(`Каталог недоступен: HTTP ${res.status}`);
+  const idx = (await res.json()) as { baseUrl: string; packs: Omit<CatalogPack, 'base'>[] };
+  return idx.packs.map((p) => ({ ...p, base: `${idx.baseUrl.replace('{ref}', p.ref)}${p.path}/` }));
+}
+
+/** Downloads a catalog pack: its manifest first, then every file, each checked by SHA-256. */
+export async function downloadCatalogPack(c: CatalogPack, onProgress: (p: Progress) => void, shouldStop: () => boolean): Promise<Integrity> {
+  const res = await fetch(`${c.base}manifest.json`);
+  if (!res.ok) throw new Error(`Манифест недоступен: HTTP ${res.status}`);
+  const info = (await res.json()) as PackInfo;
+  if (info.id !== c.id) throw new Error('Манифест не совпадает с каталогом');
+  return downloadPack(info, c.base, onProgress, shouldStop);
+}
+
+/** Downloads the original model from Hugging Face. */
+export function downloadOriginal(onProgress: (p: Progress) => void, shouldStop: () => boolean): Promise<Integrity> {
+  return downloadPack(ORIGINAL, HF_BASE, onProgress, shouldStop);
+}
+
 /**
- * Downloads the original model file by file. Files already complete (right size and hash)
- * are skipped, so an interrupted download continues where it stopped.
+ * Downloads a pack file by file. Files already complete (right size and hash) are skipped,
+ * so an interrupted download continues where it stopped.
  */
-export async function downloadOriginal(onProgress: (p: Progress) => void, shouldStop: () => boolean): Promise<Integrity> {
-  const p = ORIGINAL;
+export async function downloadPack(p: PackInfo, base: string, onProgress: (p: Progress) => void, shouldStop: () => boolean): Promise<Integrity> {
   const dir = packDir(p.id);
   dir.create({ intermediates: true, idempotent: true });
   const total = packSize(p);
@@ -127,7 +163,7 @@ export async function downloadOriginal(onProgress: (p: Progress) => void, should
     }
     if (file.exists) file.delete();
     const base = done;
-    const task = File.createDownloadTask(HF_BASE + f.path, file, {
+    const task = File.createDownloadTask(base + f.path, file, {
       onProgress: ({ bytesWritten }) => onProgress({ file: f.path, done: base + bytesWritten, total }),
     });
     await task.downloadAsync();
